@@ -125,6 +125,15 @@ def mark_present_all(attend_frame, student_names):
         expand_all.first.click()
         attend_frame.page.wait_for_timeout(300)
 
+    # Prefer the page's own "Select all" bulk action -- far more reliable
+    # than checking each row individually by name match.
+    select_all = attend_frame.locator("text=Select all")
+    if select_all.count() > 0:
+        select_all.first.click()
+        attend_frame.page.wait_for_timeout(300)
+        return
+
+    # Fallback: check each student's box individually by name match.
     for name in student_names:
         row = attend_frame.locator(f"tr:has-text('{name}')").first
         checkbox = row.locator('input[type="checkbox"][name^="attend_"]').first
