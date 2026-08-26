@@ -14,7 +14,7 @@ Required env vars:
 import os
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from nigri_playwright import run_sync, debug_attendance_page
+from nigri_playwright import run_sync, debug_attendance_page, debug_points_attempt
 
 app = Flask(__name__)
 CORS(app)  # allow calls from simchacohen1.github.io
@@ -78,6 +78,28 @@ def debug_page():
     try:
         html = debug_attendance_page(class_section=class_section, date=date, target=target)
         return jsonify({"status": "success", "html": html})
+    except Exception as e:
+        return jsonify({"status": "error", "detail": str(e)}), 500
+
+
+@app.route("/debug-points", methods=["POST"])
+def debug_points():
+    # --- auth check ---
+    provided_key = request.headers.get("X-Sync-Key")
+    if not SYNC_API_KEY or provided_key != SYNC_API_KEY:
+        return jsonify({"error": "unauthorized"}), 401
+
+    body = request.get_json(force=True, silent=True) or {}
+    class_section = body.get("class_section")
+    date = body.get("date")
+    students = body.get("students", [])
+
+    if not class_section or not date or not students:
+        return jsonify({"error": "missing class_section, date, or students"}), 400
+
+    try:
+        result = debug_points_attempt(class_section=class_section, date=date, students=students)
+        return jsonify({"status": "success", **result})
     except Exception as e:
         return jsonify({"status": "error", "detail": str(e)}), 500
 
