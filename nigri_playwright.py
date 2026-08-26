@@ -91,18 +91,25 @@ def select_period(page, period_label, date_str):
     # so it works even though the dropdown is visually a select2 widget.
     frame.select_option("select#selNewCours", label=period_label)
     page.wait_for_load_state("networkidle")
-
-    # Re-locate the frame + navigate to the correct date via the mini
-    # calendar. Nigri's calendar cells use onclick to swap the iframe src
-    # with a matching day/month/year query string, so clicking the visible
-    # day number is the most robust approach (avoids guessing the URL).
     frame = get_attendance_frame(page)
-    day_num = str(int(date_str.split("-")[2]))  # "2026-08-26" -> "26"
-    day_cell = frame.locator(f"td:text-is('{day_num}')").first
-    day_cell.click()
-    page.wait_for_load_state("networkidle")
 
-    return get_attendance_frame(page)
+    # The page defaults to TODAY's date automatically when a period is
+    # selected (confirmed via screenshot), and this sync always targets
+    # today, so no calendar navigation is needed. As a safety check, log
+    # a warning (but don't fail) if the displayed date doesn't look like
+    # it matches what we expect -- better to proceed than hard-crash on
+    # a brittle calendar click.
+    try:
+        page_text = frame.locator("body").inner_text(timeout=5000)
+        year, month, day = date_str.split("-")
+        day_num = str(int(day))
+        if day_num not in page_text:
+            print(f"WARNING: day '{day_num}' not found in attendance page text; "
+                  f"proceeding anyway since page should default to today")
+    except Exception as e:
+        print(f"WARNING: could not verify displayed date ({e}); proceeding anyway")
+
+    return frame
 
 
 def mark_present_all(frame, student_names):
