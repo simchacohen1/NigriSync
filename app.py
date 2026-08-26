@@ -14,7 +14,12 @@ Required env vars:
 import os
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from nigri_playwright import run_sync, debug_attendance_page, debug_points_attempt
+from nigri_playwright import (
+    run_sync,
+    debug_attendance_page,
+    debug_points_attempt,
+    debug_rewards_page,
+)
 
 app = Flask(__name__)
 CORS(app)  # allow calls from simchacohen1.github.io
@@ -99,6 +104,23 @@ def debug_points():
 
     try:
         result = debug_points_attempt(class_section=class_section, date=date, students=students)
+        return jsonify({"status": "success", **result})
+    except Exception as e:
+        return jsonify({"status": "error", "detail": str(e)}), 500
+
+
+@app.route("/debug-rewards", methods=["POST"])
+def debug_rewards():
+    # --- auth check ---
+    provided_key = request.headers.get("X-Sync-Key")
+    if not SYNC_API_KEY or provided_key != SYNC_API_KEY:
+        return jsonify({"error": "unauthorized"}), 401
+
+    body = request.get_json(force=True, silent=True) or {}
+    student_name = body.get("student_name")  # optional
+
+    try:
+        result = debug_rewards_page(student_name=student_name)
         return jsonify({"status": "success", **result})
     except Exception as e:
         return jsonify({"status": "error", "detail": str(e)}), 500
