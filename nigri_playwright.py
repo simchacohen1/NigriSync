@@ -55,6 +55,30 @@ CLASS_PERIODS = {
 
 POINTS_PERIOD_INDEX = 3  # 0-indexed -> "Morning Class 3"
 
+# Fixed per-student childID used in Rewards tab URLs (confirmed via
+# debug_rewards_page HTML dump, 2026-08-26). Matching students by name
+# in the attendance iframe turned out to be unreliable, but these IDs
+# are stable, so points are now applied via direct navigation to each
+# student's own "Add Points" page instead of via the attendance form.
+REWARDS_CHILD_IDS = {
+    "Greenberg Ari": "24610",
+    "Rosenfeld Zev": "26298",
+    "Schtroks Levi": "24428",
+    "Simmonds Yisroel Aryeh": "24319",
+    "Vogel Leibel": "24356",
+    "Wolf Yisroel Arye Leib": "24598",
+    "Chaikin Mayer Chaim": "21141",
+    "Gourarie Yossi": "24532",
+    "Huebner Sholom DovBer": "24385",
+    "Lapine Moshe": "26292",
+    "Notik Kehos": "17440",
+    "Oirechman Yisroel": "17439",
+    "Raichman Moshe Tuvia": "24423",
+    "Rosenfeld Avrohom": "26284",
+    "Rozmarin Levi": "21009",
+    "Traxler Arik": "21227",
+}
+
 
 def login(page):
     page.goto(NIGRI_LOGIN_URL)
@@ -370,12 +394,78 @@ def run_sync(class_section, date, students):
     return results
 
 
+def add_points_for_student(page, name, points):
+    """
+    Navigates directly to a student's "Add Points" page (via their
+    fixed childID -- see REWARDS_CHILD_IDS) and submits the points
+    form there. This replaces trying to set points inside the
+    attendance iframe, which proved unreliable.
+    """
+    if name not in REWARDS_CHILD_IDS:
+        raise RuntimeError(f"No known childID for student: {name}")
+    child_id = REWARDS_CHILD_IDS[name]
+
+    url = (
+        f"{NIGRI_BASE_URL}/main/default_os_prog.asp"
+        f"?section=teachers&spec=rewards&rewards=&rewardsGradeSelect=&childID={child_id}"
+    )
+    page.goto(url)
+    page.wait_for_load_state("networkidle")
+
+    # The points field is a <select> -- confirmed via screenshot showing
+    # "0" as default with a dropdown arrow, labeled "points" with a
+    # "Maximum allowed: N points" note next to it. Try common name
+    # patterns defensively since we haven't captured this form's exact
+    # HTML yet.
+    points_select = page.locator("select").filter(has_text="").first
+    # Prefer a more specific match if the field has a recognizable name
+    for candidate in ["select[name*=\'oint\']", "select[name*=\'reward\']", "select"]:
+        loc = page.locator(candidate)
+        if loc.count() > 0:
+            points_select = loc.first
+            break
+
+    points_select.wait_for(state="visible", timeout=8000)
+    available_values = points_select.evaluate(
+        "el => Array.from(el.options).map(o => o.value)"
+    )
+
+    target = str(points)
+    if target not in available_values:
+        raise RuntimeError(
+            f"Points value '{target}' not available for {name} "
+            f"(childID={child_id}). Available options: {available_values!r}. "
+            f"This usually means the student already hit today's max allowed points."
+        )
+
+    points_select.select_option(target)
+    points_select.evaluate(
+        """(el) => {
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+        }"""
+    )
+    page.wait_for_timeout(200)
+
+    save_btn = page.locator("input[type=\'submit\'], input[type=\'button\']").filter(
+        has_text="Save"
+    ).first
+    if save_btn.count() == 0:
+        # Fall back to any submit-looking input on the page
+        save_btn = page.locator("input[type=\'submit\']").first
+
+    save_btn.wait_for(state="visible", timeout=5000)
+    save_btn.click()
+    page.wait_for_load_state("networkidle")
+    page.wait_for_timeout(300)
+
+
 def debug_rewards_page(student_name=None):
     """
     Diagnostic: logs in, navigates to Rewards -> Rewards points, dumps
     that page's HTML (to see the student list links). If student_name
-    is given, also clicks through to that student's "Add Points" page
-    and dumps its HTML too (to see the points form's field names).
+    is given (must be a key in REWARDS_CHILD_IDS), navigates DIRECTLY
+    via that student's childID URL to their "Add Points" page and
+    dumps its HTML too (to see the points form's real field names).
     Nothing is saved/submitted either way.
     """
     with sync_playwright() as p:
@@ -393,11 +483,14 @@ def debug_rewards_page(student_name=None):
         student_page_html = None
 
         if student_name:
-            # The magnifying-glass icon links are the only clickable
-            # element per row; click the one in the row containing
-            # this student's name.
-            row = page.locator(f"tr:has-text('{student_name}')").first
-            row.locator("a, img").last.click()
+            if student_name not in REWARDS_CHILD_IDS:
+                raise RuntimeError(f"No known childID for student: {student_name}")
+            child_id = REWARDS_CHILD_IDS[student_name]
+            url = (
+                f"{NIGRI_BASE_URL}/main/default_os_prog.asp"
+                f"?section=teachers&spec=rewards&rewards=&rewardsGradeSelect=&childID={child_id}"
+            )
+            page.goto(url)
             page.wait_for_load_state("networkidle")
             student_page_html = page.content()
 
