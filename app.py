@@ -14,7 +14,7 @@ Required env vars:
 import os
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from nigri_playwright import run_sync
+from nigri_playwright import run_sync, debug_attendance_page
 
 app = Flask(__name__)
 CORS(app)  # allow calls from simchacohen1.github.io
@@ -56,6 +56,27 @@ def sync_points():
     try:
         result = run_sync(class_section=class_section, date=date, students=students)
         return jsonify({"status": "success", "detail": result})
+    except Exception as e:
+        return jsonify({"status": "error", "detail": str(e)}), 500
+
+
+@app.route("/debug-page", methods=["POST"])
+def debug_page():
+    # --- auth check ---
+    provided_key = request.headers.get("X-Sync-Key")
+    if not SYNC_API_KEY or provided_key != SYNC_API_KEY:
+        return jsonify({"error": "unauthorized"}), 401
+
+    body = request.get_json(force=True, silent=True) or {}
+    class_section = body.get("class_section")
+    date = body.get("date")
+
+    if not class_section or not date:
+        return jsonify({"error": "missing class_section or date"}), 400
+
+    try:
+        html = debug_attendance_page(class_section=class_section, date=date)
+        return jsonify({"status": "success", "html": html})
     except Exception as e:
         return jsonify({"status": "error", "detail": str(e)}), 500
 
