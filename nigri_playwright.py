@@ -165,22 +165,20 @@ def mark_present_all(attend_frame, student_names):
 
 
 def set_points_for_period(attend_frame, students_with_points):
+    """
+    Kept for the debug tool / backward compatibility. NOT used for the
+    real points-period sync anymore -- see
+    check_and_set_points_individually() below, which is what run_sync
+    actually calls for the points period. This version assumes
+    students are already checked (e.g. via "Select all").
+    """
     for student in students_with_points:
         name = student["name"]
         points = str(student["points"])
         row = attend_frame.locator(f"tr:has-text('{name}')").first
         rewards_select = row.locator('select[name^="rewardsPoints_"]').first
-        # Wait for this specific dropdown to actually be visible/attached
-        # before trying to set it -- it's hidden until the row's
-        # checkbox is checked, and may render slightly after the
-        # checkbox click completes.
         rewards_select.wait_for(state="visible", timeout=5000)
         rewards_select.select_option(points)
-
-        # Explicitly fire change/input/blur events in case the page's
-        # own JS state (e.g. a running point total, or a "dirty" flag
-        # needed for save) only updates on those events rather than
-        # from Playwright's internal value-set.
         rewards_select.evaluate(
             """(el) => {
                 el.dispatchEvent(new Event('input', { bubbles: true }));
@@ -189,6 +187,59 @@ def set_points_for_period(attend_frame, students_with_points):
             }"""
         )
         attend_frame.page.wait_for_timeout(150)
+
+
+def check_and_set_points_individually(attend_frame, students_with_points):
+    """
+    For the points period (Morning Class 3) specifically, the site
+    apparently only populates/enables a row's rewards dropdown when
+    THAT row's own checkbox is checked one at a time -- the "Select
+    all" bulk action does not trigger whatever per-row logic wires up
+    the dropdown's options. So for this period we go student by
+    student: check the box, wait for that row's dropdown to be ready,
+    set the points value, then move to the next student.
+    """
+    expand_all = attend_frame.locator("text=Expand all")
+    if expand_all.count() > 0:
+        expand_all.first.click()
+        attend_frame.page.wait_for_timeout(300)
+
+    for student in students_with_points:
+        name = student["name"]
+        points = str(student["points"])
+        row = attend_frame.locator(f"tr:has-text('{name}')").first
+
+        checkbox = row.locator('input[type="checkbox"][name^="attend_"]').first
+        checkbox.check()
+        attend_frame.page.wait_for_timeout(300)
+
+        rewards_select = row.locator('select[name^="rewardsPoints_"]').first
+        rewards_select.wait_for(state="visible", timeout=5000)
+
+        # Give the page a brief moment after the checkbox check to
+        # finish whatever AJAX/JS populates this row's option list,
+        # then confirm the option we need actually exists before
+        # trying to select it, instead of blindly calling
+        # select_option and timing out with an unhelpful error.
+        rewards_select.wait_for(state="attached", timeout=5000)
+        option_values = rewards_select.evaluate(
+            "el => Array.from(el.options).map(o => o.value)"
+        )
+        if points not in option_values:
+            attend_frame.page.wait_for_timeout(500)
+            option_values = rewards_select.evaluate(
+                "el => Array.from(el.options).map(o => o.value)"
+            )
+
+        rewards_select.select_option(points)
+        rewards_select.evaluate(
+            """(el) => {
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+                el.blur();
+            }"""
+        )
+        attend_frame.page.wait_for_timeout(200)
 
 
 def save_period(page, attend_frame):
@@ -291,10 +342,16 @@ def run_sync(class_section, date, students):
 
         for idx, period_name in enumerate(periods):
             attend_frame = select_period(page, period_name, date)
-            mark_present_all(attend_frame, student_names)
 
             if idx == POINTS_PERIOD_INDEX:
-                set_points_for_period(attend_frame, students)
+                # This period needs each student checked individually,
+                # with their points dropdown set right after -- "Select
+                # all" does not reliably populate/register the rewards
+                # dropdowns for this period. See
+                # check_and_set_points_individually() for why.
+                check_and_set_points_individually(attend_frame, students)
+            else:
+                mark_present_all(attend_frame, student_names)
 
             save_period(page, attend_frame)
             results.append(
