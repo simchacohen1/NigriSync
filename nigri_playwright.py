@@ -81,18 +81,38 @@ def get_list_frame(page):
     raise RuntimeError("Could not locate the frame containing the period picker")
 
 
-def get_attend_frame(page):
+def get_attend_frame(page, timeout_ms=8000, poll_ms=300):
     """
     The actual attendance checkboxes/rewards/save-button form lives in
     an iframe named "attend" (confirmed via debug HTML dump), nested
     inside the list frame. Playwright's page.frame(name=...) finds a
     frame by name anywhere in the page's frame tree regardless of
     nesting depth, so we don't need to manually walk the hierarchy.
+
+    The site sometimes takes longer than expected to swap in the new
+    "attend" iframe after the period picker changes, so this polls
+    for it instead of giving up after a single fixed-length wait.
     """
-    page.wait_for_timeout(500)
+    waited = 0
     frame = page.frame(name="attend")
+    while frame is None and waited < timeout_ms:
+        page.wait_for_timeout(poll_ms)
+        waited += poll_ms
+        frame = page.frame(name="attend")
+
     if frame is None:
-        raise RuntimeError("Could not locate the 'attend' iframe on the page")
+        raise RuntimeError(
+            f"Could not locate the 'attend' iframe on the page after {timeout_ms}ms"
+        )
+
+    # Also make sure the frame has actually finished loading its own
+    # content (not just been created as an empty placeholder) by
+    # waiting for a known element inside it.
+    try:
+        frame.wait_for_selector("form#attendFrm", timeout=timeout_ms)
+    except Exception:
+        pass  # fall through and let the caller's own logic surface any real problem
+
     return frame
 
 
@@ -155,12 +175,35 @@ def set_points_for_period(attend_frame, students_with_points):
         # checkbox is checked, and may render slightly after the
         # checkbox click completes.
         rewards_select.wait_for(state="visible", timeout=5000)
+
+        # Click the dropdown open first, like a real user would, rather
+        # than only setting the underlying <select> value programmatically.
+        # Some pages listen for click/focus before they'll register a
+        # later change event as "real".
+        rewards_select.click()
+        attend_frame.page.wait_for_timeout(150)
         rewards_select.select_option(points)
+
+        # Explicitly fire change/input/blur events in case the page's
+        # own JS state (e.g. a running point total, or a "dirty" flag
+        # needed for save) only updates on those events rather than
+        # from Playwright's internal value-set.
+        rewards_select.evaluate(
+            """(el) => {
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+                el.blur();
+            }"""
+        )
+        attend_frame.page.wait_for_timeout(150)
 
 
 def save_period(page, attend_frame):
-    attend_frame.click("input#attendSubmitBtn")
+    save_btn = attend_frame.locator("input#attendSubmitBtn")
+    save_btn.wait_for(state="visible", timeout=5000)
+    save_btn.click()
     page.wait_for_load_state("networkidle")
+    page.wait_for_timeout(500)
 
 
 def debug_points_attempt(class_section, date, students):
