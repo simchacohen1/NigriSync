@@ -163,6 +163,53 @@ def save_period(page, attend_frame):
     page.wait_for_load_state("networkidle")
 
 
+def debug_points_attempt(class_section, date, students):
+    """
+    Diagnostic: logs in, goes to the POINTS period (Morning Class 3),
+    selects all students, then tries to set points -- but instead of
+    saving, it captures each rewards dropdown's outerHTML (including
+    the actual <option> list and whichever value ended up selected)
+    so we can see exactly what the automation sees at that moment,
+    before any save/reload can reset/mask it.
+    """
+    if class_section not in CLASS_PERIODS:
+        raise ValueError(f"Unknown class_section: {class_section}")
+
+    period_name = CLASS_PERIODS[class_section][POINTS_PERIOD_INDEX]
+    student_names = [s["name"] for s in students]
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+
+        login(page)
+        go_to_attendance_tab(page)
+        attend_frame = select_period(page, period_name, date)
+        mark_present_all(attend_frame, student_names)
+
+        report = []
+        errors = []
+        for student in students:
+            name = student["name"]
+            points = str(student["points"])
+            row = attend_frame.locator(f"tr:has-text('{name}')").first
+            rewards_select = row.locator('select[name^="rewardsPoints_"]').first
+            entry = {"name": name, "target_points": points}
+            try:
+                entry["count_found"] = rewards_select.count()
+                entry["is_visible"] = rewards_select.is_visible()
+                entry["outer_html_before"] = rewards_select.evaluate("el => el.outerHTML")
+                rewards_select.select_option(points)
+                entry["value_after_select"] = rewards_select.evaluate("el => el.value")
+            except Exception as e:
+                errors.append(f"{name}: {str(e)}")
+            report.append(entry)
+
+        browser.close()
+
+    return {"period": period_name, "rows": report, "errors": errors}
+
+
 def debug_attendance_page(class_section, date, target="attend"):
     """
     Diagnostic helper: logs in, navigates to the FIRST period of the
