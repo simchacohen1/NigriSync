@@ -231,6 +231,12 @@ def check_and_set_points_individually(attend_frame, students_with_points):
                 "el => Array.from(el.options).map(o => o.value)"
             )
 
+        if points not in option_values:
+            raise RuntimeError(
+                f"Points value '{points}' not found in rewards dropdown "
+                f"for {name}. Actual option values present: {option_values!r}"
+            )
+
         rewards_select.select_option(points)
         rewards_select.evaluate(
             """(el) => {
@@ -362,3 +368,42 @@ def run_sync(class_section, date, students):
         browser.close()
 
     return results
+
+
+def debug_rewards_page(student_name=None):
+    """
+    Diagnostic: logs in, navigates to Rewards -> Rewards points, dumps
+    that page's HTML (to see the student list links). If student_name
+    is given, also clicks through to that student's "Add Points" page
+    and dumps its HTML too (to see the points form's field names).
+    Nothing is saved/submitted either way.
+    """
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+
+        login(page)
+
+        page.click("text=Rewards")
+        page.wait_for_load_state("networkidle")
+        page.click("text=Rewards points")
+        page.wait_for_load_state("networkidle")
+
+        rewards_list_html = page.content()
+        student_page_html = None
+
+        if student_name:
+            # The magnifying-glass icon links are the only clickable
+            # element per row; click the one in the row containing
+            # this student's name.
+            row = page.locator(f"tr:has-text('{student_name}')").first
+            row.locator("a, img").last.click()
+            page.wait_for_load_state("networkidle")
+            student_page_html = page.content()
+
+        browser.close()
+
+    return {
+        "rewards_list_html": rewards_list_html,
+        "student_page_html": student_page_html,
+    }
