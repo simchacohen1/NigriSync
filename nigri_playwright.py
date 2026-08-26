@@ -175,13 +175,6 @@ def set_points_for_period(attend_frame, students_with_points):
         # checkbox is checked, and may render slightly after the
         # checkbox click completes.
         rewards_select.wait_for(state="visible", timeout=5000)
-
-        # Click the dropdown open first, like a real user would, rather
-        # than only setting the underlying <select> value programmatically.
-        # Some pages listen for click/focus before they'll register a
-        # later change event as "real".
-        rewards_select.click()
-        attend_frame.page.wait_for_timeout(150)
         rewards_select.select_option(points)
 
         # Explicitly fire change/input/blur events in case the page's
