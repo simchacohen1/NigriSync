@@ -70,12 +70,13 @@ def debug_page():
     body = request.get_json(force=True, silent=True) or {}
     class_section = body.get("class_section")
     date = body.get("date")
+    target = body.get("target", "attend")
 
     if not class_section or not date:
         return jsonify({"error": "missing class_section or date"}), 400
 
     try:
-        html = debug_attendance_page(class_section=class_section, date=date)
+        html = debug_attendance_page(class_section=class_section, date=date, target=target)
         return jsonify({"status": "success", "html": html})
     except Exception as e:
         return jsonify({"status": "error", "detail": str(e)}), 500
