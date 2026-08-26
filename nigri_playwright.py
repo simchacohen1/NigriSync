@@ -64,20 +64,36 @@ def login(page):
     page.wait_for_load_state("networkidle")
 
 
-def get_attendance_frame(page):
+def get_list_frame(page):
     """
-    The attendance form lives inside a nested iframe. Rather than
-    hardcode a frame name (which may not be stable), find whichever
-    frame currently contains the attendance form.
+    Finds the frame that contains the period picker (select#selNewCours).
+    This frame ALSO contains two child iframes: #cal (calendar) and
+    #attend (the actual student checkboxes/rewards form) -- those live
+    one level deeper and must be fetched separately via get_attend_frame.
     """
     page.wait_for_timeout(500)
     for frame in page.frames:
         try:
-            if frame.query_selector("form#attendFrm") or frame.query_selector("select#selNewCours"):
+            if frame.query_selector("select#selNewCours"):
                 return frame
         except Exception:
             continue
-    raise RuntimeError("Could not locate the attendance iframe on the page")
+    raise RuntimeError("Could not locate the frame containing the period picker")
+
+
+def get_attend_frame(page):
+    """
+    The actual attendance checkboxes/rewards/save-button form lives in
+    an iframe named "attend" (confirmed via debug HTML dump), nested
+    inside the list frame. Playwright's page.frame(name=...) finds a
+    frame by name anywhere in the page's frame tree regardless of
+    nesting depth, so we don't need to manually walk the hierarchy.
+    """
+    page.wait_for_timeout(500)
+    frame = page.frame(name="attend")
+    if frame is None:
+        raise RuntimeError("Could not locate the 'attend' iframe on the page")
+    return frame
 
 
 def go_to_attendance_tab(page):
@@ -86,65 +102,56 @@ def go_to_attendance_tab(page):
 
 
 def select_period(page, period_label, date_str):
-    frame = get_attendance_frame(page)
+    list_frame = get_list_frame(page)
     # select_option operates on the underlying <select> DOM node directly,
     # so it works even though the dropdown is visually a select2 widget.
-    frame.select_option("select#selNewCours", label=period_label)
+    # Changing it navigates the list_frame itself (document.location=...),
+    # which also causes its child iframes (#cal, #attend) to reload with
+    # the new classID.
+    list_frame.select_option("select#selNewCours", label=period_label)
     page.wait_for_load_state("networkidle")
-    frame = get_attendance_frame(page)
+    page.wait_for_timeout(1000)  # let child iframes finish reloading
 
-    # The page defaults to TODAY's date automatically when a period is
-    # selected (confirmed via screenshot), and this sync always targets
-    # today, so no calendar navigation is needed. As a safety check, log
-    # a warning (but don't fail) if the displayed date doesn't look like
-    # it matches what we expect -- better to proceed than hard-crash on
-    # a brittle calendar click.
-    try:
-        page_text = frame.locator("body").inner_text(timeout=5000)
-        year, month, day = date_str.split("-")
-        day_num = str(int(day))
-        if day_num not in page_text:
-            print(f"WARNING: day '{day_num}' not found in attendance page text; "
-                  f"proceeding anyway since page should default to today")
-    except Exception as e:
-        print(f"WARNING: could not verify displayed date ({e}); proceeding anyway")
-
-    return frame
+    # The #attend iframe's src URL already includes today's day (dy=26,
+    # etc) automatically -- confirmed via debug HTML dump -- so no
+    # calendar click is needed since this sync always targets today.
+    return get_attend_frame(page)
 
 
-def mark_present_all(frame, student_names):
+def mark_present_all(attend_frame, student_names):
     # Expand every row so checkboxes are interactable
-    expand_all = frame.locator("text=Expand all")
+    expand_all = attend_frame.locator("text=Expand all")
     if expand_all.count() > 0:
         expand_all.first.click()
+        attend_frame.page.wait_for_timeout(300)
 
     for name in student_names:
-        row = frame.locator(f"tr:has-text('{name}')").first
+        row = attend_frame.locator(f"tr:has-text('{name}')").first
         checkbox = row.locator('input[type="checkbox"][name^="attend_"]').first
         checkbox.check()
 
 
-def set_points_for_period(frame, students_with_points):
+def set_points_for_period(attend_frame, students_with_points):
     for student in students_with_points:
         name = student["name"]
         points = str(student["points"])
-        row = frame.locator(f"tr:has-text('{name}')").first
+        row = attend_frame.locator(f"tr:has-text('{name}')").first
         rewards_select = row.locator('select[name^="rewardsPoints_"]').first
         rewards_select.select_option(points)
 
 
-def save_period(page, frame):
-    frame.click("input#attendSubmitBtn")
+def save_period(page, attend_frame):
+    attend_frame.click("input#attendSubmitBtn")
     page.wait_for_load_state("networkidle")
 
 
-def debug_attendance_page(class_section, date):
+def debug_attendance_page(class_section, date, target="attend"):
     """
     Diagnostic helper: logs in, navigates to the FIRST period of the
-    given class_section, and returns the raw HTML of the attendance
-    frame. Used to inspect real selectors (row structure, checkbox
-    names) when a step is failing and we need to see the actual DOM
-    instead of guessing.
+    given class_section, and returns the raw HTML of either the list
+    frame (target="list") or the attend frame (target="attend",
+    default) -- whichever we currently need to inspect real selectors
+    on, instead of guessing.
     """
     if class_section not in CLASS_PERIODS:
         raise ValueError(f"Unknown class_section: {class_section}")
@@ -156,8 +163,11 @@ def debug_attendance_page(class_section, date):
         page = browser.new_page()
         login(page)
         go_to_attendance_tab(page)
-        frame = select_period(page, period_name, date)
-        html = frame.content()
+        attend_frame = select_period(page, period_name, date)
+        if target == "list":
+            html = get_list_frame(page).content()
+        else:
+            html = attend_frame.content()
         browser.close()
 
     return html
@@ -179,13 +189,13 @@ def run_sync(class_section, date, students):
         go_to_attendance_tab(page)
 
         for idx, period_name in enumerate(periods):
-            frame = select_period(page, period_name, date)
-            mark_present_all(frame, student_names)
+            attend_frame = select_period(page, period_name, date)
+            mark_present_all(attend_frame, student_names)
 
             if idx == POINTS_PERIOD_INDEX:
-                set_points_for_period(frame, students)
+                set_points_for_period(attend_frame, students)
 
-            save_period(page, frame)
+            save_period(page, attend_frame)
             results.append(
                 f"{period_name}: attendance saved"
                 + (" + points" if idx == POINTS_PERIOD_INDEX else "")
