@@ -138,6 +138,31 @@ def save_period(page, frame):
     page.wait_for_load_state("networkidle")
 
 
+def debug_attendance_page(class_section, date):
+    """
+    Diagnostic helper: logs in, navigates to the FIRST period of the
+    given class_section, and returns the raw HTML of the attendance
+    frame. Used to inspect real selectors (row structure, checkbox
+    names) when a step is failing and we need to see the actual DOM
+    instead of guessing.
+    """
+    if class_section not in CLASS_PERIODS:
+        raise ValueError(f"Unknown class_section: {class_section}")
+
+    period_name = CLASS_PERIODS[class_section][0]
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+        login(page)
+        go_to_attendance_tab(page)
+        frame = select_period(page, period_name, date)
+        html = frame.content()
+        browser.close()
+
+    return html
+
+
 def run_sync(class_section, date, students):
     if class_section not in CLASS_PERIODS:
         raise ValueError(f"Unknown class_section: {class_section}")
