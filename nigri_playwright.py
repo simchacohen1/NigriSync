@@ -130,7 +130,10 @@ def mark_present_all(attend_frame, student_names):
     select_all = attend_frame.locator("text=Select all")
     if select_all.count() > 0:
         select_all.first.click()
-        attend_frame.page.wait_for_timeout(300)
+        # Give the page time to reveal each row's rewards dropdown --
+        # these are hidden until the checkbox is checked, and that
+        # reveal isn't necessarily instant across all rows.
+        attend_frame.page.wait_for_timeout(800)
         return
 
     # Fallback: check each student's box individually by name match.
@@ -138,6 +141,7 @@ def mark_present_all(attend_frame, student_names):
         row = attend_frame.locator(f"tr:has-text('{name}')").first
         checkbox = row.locator('input[type="checkbox"][name^="attend_"]').first
         checkbox.check()
+    attend_frame.page.wait_for_timeout(500)
 
 
 def set_points_for_period(attend_frame, students_with_points):
@@ -146,6 +150,11 @@ def set_points_for_period(attend_frame, students_with_points):
         points = str(student["points"])
         row = attend_frame.locator(f"tr:has-text('{name}')").first
         rewards_select = row.locator('select[name^="rewardsPoints_"]').first
+        # Wait for this specific dropdown to actually be visible/attached
+        # before trying to set it -- it's hidden until the row's
+        # checkbox is checked, and may render slightly after the
+        # checkbox click completes.
+        rewards_select.wait_for(state="visible", timeout=5000)
         rewards_select.select_option(points)
 
 
