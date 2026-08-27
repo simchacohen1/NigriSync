@@ -188,34 +188,50 @@ def mark_present_all(attend_frame, student_names):
     attend_frame.page.wait_for_timeout(500)
 
 
-def mark_attendance_for_period(attend_frame, present_names, absent_names):
+def set_attendance_status(attend_frame, present_names, absent_names, excused_names):
     """
-    Like mark_present_all, but supports a mix of present/absent
-    students within the same period (needed now that attendance is
-    tracked per-period per-student rather than uniformly for everyone).
+    Sets each student's real attendance checkboxes for one period.
+    Confirmed via debug HTML dump (2026-08-27) that "Excused" is NOT a
+    3rd value on the attend_{childID} checkbox -- it's a SEPARATE
+    checkbox (isExcused_{childID}) that combines with it:
 
-    If nobody is absent, this is equivalent to mark_present_all (uses
-    the fast "Select all" path). Otherwise it checks each present
-    student's box individually by name -- "Select all" has no
-    "select all except these" variant on this site.
+        Present  -> attend_{childID} checked,   isExcused_{childID} unchecked
+        Absent   -> attend_{childID} unchecked, isExcused_{childID} unchecked
+        Excused  -> attend_{childID} unchecked, isExcused_{childID} checked
+
+    Targets each checkbox directly by name using the student's fixed
+    childID (see REWARDS_CHILD_IDS) instead of row-text matching --
+    more reliable, and the isExcused checkbox lives in a hidden detail
+    row that's easier to reach this way once "Expand all" has run.
     """
     expand_all = attend_frame.locator("text=Expand all")
     if expand_all.count() > 0:
         expand_all.first.click()
         attend_frame.page.wait_for_timeout(300)
 
-    if not absent_names:
-        select_all = attend_frame.locator("text=Select all")
-        if select_all.count() > 0:
-            select_all.first.click()
-            attend_frame.page.wait_for_timeout(800)
-            return
+    def _apply(name, attend_should_be_checked, excused_should_be_checked):
+        if name not in REWARDS_CHILD_IDS:
+            raise RuntimeError(f"No known childID for student: {name}")
+        cid = REWARDS_CHILD_IDS[name]
+
+        attend_cb = attend_frame.locator(f'input[name="attend_{cid}"]')
+        if attend_cb.is_checked() != attend_should_be_checked:
+            attend_cb.set_checked(attend_should_be_checked)
+            attend_frame.page.wait_for_timeout(150)
+
+        excused_cb = attend_frame.locator(f'input[name="isExcused_{cid}"]')
+        if excused_cb.is_checked() != excused_should_be_checked:
+            excused_cb.set_checked(excused_should_be_checked)
+            attend_frame.page.wait_for_timeout(150)
 
     for name in present_names:
-        row = attend_frame.locator(f"tr:has-text('{name}')").first
-        checkbox = row.locator('input[type="checkbox"][name^="attend_"]').first
-        checkbox.check()
-    attend_frame.page.wait_for_timeout(500)
+        _apply(name, attend_should_be_checked=True, excused_should_be_checked=False)
+    for name in absent_names:
+        _apply(name, attend_should_be_checked=False, excused_should_be_checked=False)
+    for name in excused_names:
+        _apply(name, attend_should_be_checked=False, excused_should_be_checked=True)
+
+    attend_frame.page.wait_for_timeout(300)
 
 
 def set_points_for_period(attend_frame, students_with_points):
@@ -392,21 +408,28 @@ def debug_attendance_page(class_section, date, target="attend"):
     return html
 
 
+# Order MUST match CLASS_PERIODS[class_section] index-for-index --
+# this is how each student's per-period status (sent from sync.html
+# as student["attendance"][period_key]) gets matched to the right
+# period on the Nigri site.
+PERIOD_KEYS = ["davening", "class1", "class2", "class3"]
+
+
 def run_sync(class_section, date, students):
     """
     One button, two phases, one browser session:
-      1. Mark ALL 4 periods "Present" via the attendance tab (unchanged,
-         confirmed working -- uses the site's "Select all" link).
+      1. For each of the 4 periods, mark each student Present, Absent,
+         or Excused per that student's OWN per-period status (sent from
+         sync.html as student["attendance"][period_key]) -- see
+         set_attendance_status. Replaces the old behavior of blindly
+         marking everyone Present every period.
       2. Give each student their points via the Rewards tab directly
-         (see add_points_for_student) -- this replaced the earlier
-         attempt to set points inside the attendance form's rewards
-         dropdown, which the site would not reliably register.
+         (see add_points_for_student) -- unchanged, confirmed working.
     """
     if class_section not in CLASS_PERIODS:
         raise ValueError(f"Unknown class_section: {class_section}")
 
     periods = CLASS_PERIODS[class_section]
-    student_names = [s["name"] for s in students]
     results = []
 
     with sync_playwright() as p:
@@ -415,13 +438,27 @@ def run_sync(class_section, date, students):
 
         login(page)
 
-        # --- Phase 1: attendance, all 4 periods ---
+        # --- Phase 1: attendance, per period, per-student status ---
         go_to_attendance_tab(page)
-        for period_name in periods:
+        for period_index, period_name in enumerate(periods):
+            period_key = PERIOD_KEYS[period_index]
+            present_names, absent_names, excused_names = [], [], []
+            for student in students:
+                status = student.get("attendance", {}).get(period_key, "present")
+                if status == "absent":
+                    absent_names.append(student["name"])
+                elif status == "excused":
+                    excused_names.append(student["name"])
+                else:
+                    present_names.append(student["name"])
+
             attend_frame = select_period(page, period_name, date)
-            mark_present_all(attend_frame, student_names)
+            set_attendance_status(attend_frame, present_names, absent_names, excused_names)
             save_period(page, attend_frame)
-            results.append(f"{period_name}: attendance saved")
+            results.append(
+                f"{period_name}: saved (present={len(present_names)}, "
+                f"absent={len(absent_names)}, excused={len(excused_names)})"
+            )
 
         # --- Phase 2: points, via Rewards tab, one student at a time ---
         for student in students:
