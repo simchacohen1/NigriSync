@@ -188,6 +188,36 @@ def mark_present_all(attend_frame, student_names):
     attend_frame.page.wait_for_timeout(500)
 
 
+def mark_attendance_for_period(attend_frame, present_names, absent_names):
+    """
+    Like mark_present_all, but supports a mix of present/absent
+    students within the same period (needed now that attendance is
+    tracked per-period per-student rather than uniformly for everyone).
+
+    If nobody is absent, this is equivalent to mark_present_all (uses
+    the fast "Select all" path). Otherwise it checks each present
+    student's box individually by name -- "Select all" has no
+    "select all except these" variant on this site.
+    """
+    expand_all = attend_frame.locator("text=Expand all")
+    if expand_all.count() > 0:
+        expand_all.first.click()
+        attend_frame.page.wait_for_timeout(300)
+
+    if not absent_names:
+        select_all = attend_frame.locator("text=Select all")
+        if select_all.count() > 0:
+            select_all.first.click()
+            attend_frame.page.wait_for_timeout(800)
+            return
+
+    for name in present_names:
+        row = attend_frame.locator(f"tr:has-text('{name}')").first
+        checkbox = row.locator('input[type="checkbox"][name^="attend_"]').first
+        checkbox.check()
+    attend_frame.page.wait_for_timeout(500)
+
+
 def set_points_for_period(attend_frame, students_with_points):
     """
     Kept for the debug tool / backward compatibility. NOT used for the
@@ -349,6 +379,13 @@ def debug_attendance_page(class_section, date, target="attend"):
         if target == "list":
             html = get_list_frame(page).content()
         else:
+            # Expand rows so the per-student detail (Excused, No Headset,
+            # No Mic, No Webcam, No Book, etc.) is present in the HTML --
+            # it's hidden/collapsed by default and won't appear otherwise.
+            expand_all = attend_frame.locator("text=Expand all")
+            if expand_all.count() > 0:
+                expand_all.first.click()
+                attend_frame.page.wait_for_timeout(300)
             html = attend_frame.content()
         browser.close()
 
