@@ -356,6 +356,15 @@ def debug_attendance_page(class_section, date, target="attend"):
 
 
 def run_sync(class_section, date, students):
+    """
+    One button, two phases, one browser session:
+      1. Mark ALL 4 periods "Present" via the attendance tab (unchanged,
+         confirmed working -- uses the site's "Select all" link).
+      2. Give each student their points via the Rewards tab directly
+         (see add_points_for_student) -- this replaced the earlier
+         attempt to set points inside the attendance form's rewards
+         dropdown, which the site would not reliably register.
+    """
     if class_section not in CLASS_PERIODS:
         raise ValueError(f"Unknown class_section: {class_section}")
 
@@ -368,26 +377,24 @@ def run_sync(class_section, date, students):
         page = browser.new_page()
 
         login(page)
+
+        # --- Phase 1: attendance, all 4 periods ---
         go_to_attendance_tab(page)
-
-        for idx, period_name in enumerate(periods):
+        for period_name in periods:
             attend_frame = select_period(page, period_name, date)
-
-            if idx == POINTS_PERIOD_INDEX:
-                # This period needs each student checked individually,
-                # with their points dropdown set right after -- "Select
-                # all" does not reliably populate/register the rewards
-                # dropdowns for this period. See
-                # check_and_set_points_individually() for why.
-                check_and_set_points_individually(attend_frame, students)
-            else:
-                mark_present_all(attend_frame, student_names)
-
+            mark_present_all(attend_frame, student_names)
             save_period(page, attend_frame)
-            results.append(
-                f"{period_name}: attendance saved"
-                + (" + points" if idx == POINTS_PERIOD_INDEX else "")
-            )
+            results.append(f"{period_name}: attendance saved")
+
+        # --- Phase 2: points, via Rewards tab, one student at a time ---
+        for student in students:
+            name = student["name"]
+            points = student["points"]
+            try:
+                add_points_for_student(page, name, points)
+                results.append(f"{name}: {points} points saved")
+            except Exception as e:
+                results.append(f"{name}: POINTS FAILED - {e}")
 
         browser.close()
 
@@ -398,8 +405,11 @@ def add_points_for_student(page, name, points):
     """
     Navigates directly to a student's "Add Points" page (via their
     fixed childID -- see REWARDS_CHILD_IDS) and submits the points
-    form there. This replaces trying to set points inside the
-    attendance iframe, which proved unreliable.
+    form there. Confirmed exact form structure via debug_rewards_page
+    HTML dump (2026-08-26):
+      <select name="rewardsPoints" id="rewardsPoints"> ... </select>
+      <input name="rewardsReason" ...>
+      <input type="submit" value="Save!">
     """
     if name not in REWARDS_CHILD_IDS:
         raise RuntimeError(f"No known childID for student: {name}")
@@ -412,25 +422,13 @@ def add_points_for_student(page, name, points):
     page.goto(url)
     page.wait_for_load_state("networkidle")
 
-    # The points field is a <select> -- confirmed via screenshot showing
-    # "0" as default with a dropdown arrow, labeled "points" with a
-    # "Maximum allowed: N points" note next to it. Try common name
-    # patterns defensively since we haven't captured this form's exact
-    # HTML yet.
-    points_select = page.locator("select").filter(has_text="").first
-    # Prefer a more specific match if the field has a recognizable name
-    for candidate in ["select[name*=\'oint\']", "select[name*=\'reward\']", "select"]:
-        loc = page.locator(candidate)
-        if loc.count() > 0:
-            points_select = loc.first
-            break
-
+    points_select = page.locator("select#rewardsPoints")
     points_select.wait_for(state="visible", timeout=8000)
+
+    target = str(points)
     available_values = points_select.evaluate(
         "el => Array.from(el.options).map(o => o.value)"
     )
-
-    target = str(points)
     if target not in available_values:
         raise RuntimeError(
             f"Points value '{target}' not available for {name} "
@@ -439,20 +437,8 @@ def add_points_for_student(page, name, points):
         )
 
     points_select.select_option(target)
-    points_select.evaluate(
-        """(el) => {
-            el.dispatchEvent(new Event('change', { bubbles: true }));
-        }"""
-    )
-    page.wait_for_timeout(200)
 
-    save_btn = page.locator("input[type=\'submit\'], input[type=\'button\']").filter(
-        has_text="Save"
-    ).first
-    if save_btn.count() == 0:
-        # Fall back to any submit-looking input on the page
-        save_btn = page.locator("input[type=\'submit\']").first
-
+    save_btn = page.locator('input[type="submit"][value="Save!"]')
     save_btn.wait_for(state="visible", timeout=5000)
     save_btn.click()
     page.wait_for_load_state("networkidle")
