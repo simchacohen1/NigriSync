@@ -117,7 +117,7 @@ def get_list_frame(page):
     raise RuntimeError("Could not locate the frame containing the period picker")
 
 
-def get_attend_frame(page, timeout_ms=15000, poll_ms=300):
+def get_attend_frame(page, timeout_ms=20000, poll_ms=300):
     """
     The actual attendance checkboxes/rewards/save-button form lives in
     an iframe named "attend" (confirmed via debug HTML dump), nested
@@ -125,47 +125,50 @@ def get_attend_frame(page, timeout_ms=15000, poll_ms=300):
     frame by name anywhere in the page's frame tree regardless of
     nesting depth, so we don't need to manually walk the hierarchy.
 
-    The site sometimes takes longer than expected to swap in the new
-    "attend" iframe after the period picker changes, so this polls
-    for it instead of giving up after a single fixed-length wait.
+    IMPORTANT: changing the period picker makes the list frame reload,
+    which detaches the OLD "attend" iframe and creates a brand new one
+    with the same name. If we grab page.frame(name="attend") once and
+    then just wait on that single object, we can end up holding a
+    reference to the outgoing frame (or a placeholder that never
+    finishes loading) and sit there for the whole timeout waiting on
+    it, even though a fresh, fully-loaded "attend" frame shows up
+    moments later elsewhere in the frame tree. This bit us switching
+    from Davening to Morning Class 1 (2026-08-28).
+
+    So instead of fetch-once-then-wait, this re-fetches the "attend"
+    frame fresh on every poll and only accepts one that is (a) not
+    detached and (b) already has at least one student checkbox
+    rendered -- if that specific frame isn't ready yet, we don't keep
+    waiting on it, we just loop and grab whatever "attend" frame
+    exists a moment later.
     """
     waited = 0
-    frame = page.frame(name="attend")
-    while frame is None and waited < timeout_ms:
+    last_seen_but_empty = False
+
+    while waited < timeout_ms:
+        frame = page.frame(name="attend")
+        if frame is not None and not frame.is_detached():
+            last_seen_but_empty = True
+            try:
+                frame.wait_for_selector('input[name^="attend_"]', timeout=poll_ms)
+                return frame
+            except Exception:
+                pass  # this particular frame isn't ready (or is on its way out) -- keep polling
+
         page.wait_for_timeout(poll_ms)
         waited += poll_ms
-        frame = page.frame(name="attend")
 
-    if frame is None:
+    if last_seen_but_empty:
         raise RuntimeError(
-            f"Could not locate the 'attend' iframe on the page after {timeout_ms}ms"
+            "The 'attend' iframe appeared but no student checkboxes ever "
+            "showed up inside it (no input[name^='attend_'] found), even "
+            "after re-checking repeatedly. This usually means the period "
+            "picker change didn't fully take effect before we started "
+            "looking."
         )
-
-    # Also make sure the frame has actually finished loading its own
-    # content (not just been created as an empty placeholder) by
-    # waiting for a known element inside it.
-    try:
-        frame.wait_for_selector("form#attendFrm", timeout=timeout_ms)
-    except Exception:
-        pass  # fall through and let the caller's own logic surface any real problem
-
-    # The form shell can exist before the student rows inside it have
-    # actually rendered -- when that happened, the very first
-    # attend_{childID} checkbox we looked for wasn't there yet and we
-    # hung for a full 30s deep inside set_attendance_status with a
-    # confusing error. Wait here instead, for an actual student
-    # checkbox, so any real problem surfaces immediately and clearly.
-    try:
-        frame.wait_for_selector('input[name^="attend_"]', timeout=timeout_ms)
-    except Exception:
-        raise RuntimeError(
-            "The 'attend' iframe loaded but no student checkboxes ever "
-            "appeared inside it (no input[name^='attend_'] found). This "
-            "usually means the period picker change didn't fully take "
-            "effect before we started looking."
-        )
-
-    return frame
+    raise RuntimeError(
+        f"Could not locate any 'attend' iframe on the page after {timeout_ms}ms"
+    )
 
 
 def go_to_attendance_tab(page):
@@ -182,7 +185,7 @@ def select_period(page, period_label, date_str):
     # the new classID.
     list_frame.select_option("select#selNewCours", label=period_label)
     page.wait_for_load_state("networkidle")
-    page.wait_for_timeout(1000)  # let child iframes finish reloading
+    page.wait_for_timeout(1500)  # let child iframes finish reloading
 
     # The #attend iframe's src URL already includes today's day (dy=26,
     # etc) automatically -- confirmed via debug HTML dump -- so no
