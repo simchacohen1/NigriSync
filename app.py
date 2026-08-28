@@ -19,6 +19,7 @@ from nigri_playwright import (
     debug_attendance_page,
     debug_points_attempt,
     debug_rewards_page,
+    SyncError,
 )
 
 app = Flask(__name__)
@@ -61,6 +62,8 @@ def sync_points():
     try:
         result = run_sync(class_section=class_section, date=date, students=students)
         return jsonify({"status": "success", "detail": result})
+    except SyncError as e:
+        return jsonify({"status": "error", "detail": str(e), "completed_before_failure": e.partial_results}), 500
     except Exception as e:
         return jsonify({"status": "error", "detail": str(e)}), 500
 
