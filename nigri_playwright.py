@@ -188,7 +188,7 @@ def mark_present_all(attend_frame, student_names):
     attend_frame.page.wait_for_timeout(500)
 
 
-def set_attendance_status(attend_frame, present_names, absent_names, excused_names):
+def set_attendance_status(attend_frame, present_names, absent_names, excused_names, late_minutes=None):
     """
     Sets each student's real attendance checkboxes for one period.
     Confirmed via debug HTML dump (2026-08-27) that "Excused" is NOT a
@@ -199,11 +199,18 @@ def set_attendance_status(attend_frame, present_names, absent_names, excused_nam
         Absent   -> attend_{childID} unchecked, isExcused_{childID} unchecked
         Excused  -> attend_{childID} unchecked, isExcused_{childID} checked
 
+    "Late" works the same way -- it's a student who IS present, plus a
+    separate isLate_{childID} checkbox and a lateMinutes_{childID} text
+    field that only appears once isLate is checked. late_minutes is an
+    optional {name: minutes} dict; any name in it is treated as present
+    AND late (it does not need to also appear in present_names).
+
     Targets each checkbox directly by name using the student's fixed
     childID (see REWARDS_CHILD_IDS) instead of row-text matching --
-    more reliable, and the isExcused checkbox lives in a hidden detail
-    row that's easier to reach this way once "Expand all" has run.
+    more reliable, and these checkboxes live in a hidden detail row
+    that's easier to reach this way once "Expand all" has run.
     """
+    late_minutes = late_minutes or {}
     expand_all = attend_frame.locator("text=Expand all")
     if expand_all.count() > 0:
         expand_all.first.click()
@@ -224,12 +231,28 @@ def set_attendance_status(attend_frame, present_names, absent_names, excused_nam
             excused_cb.set_checked(excused_should_be_checked)
             attend_frame.page.wait_for_timeout(150)
 
+        return cid
+
     for name in present_names:
         _apply(name, attend_should_be_checked=True, excused_should_be_checked=False)
     for name in absent_names:
         _apply(name, attend_should_be_checked=False, excused_should_be_checked=False)
     for name in excused_names:
         _apply(name, attend_should_be_checked=False, excused_should_be_checked=True)
+
+    for name, minutes in late_minutes.items():
+        cid = _apply(name, attend_should_be_checked=True, excused_should_be_checked=False)
+
+        late_cb = attend_frame.locator(f'input[name="isLate_{cid}"]')
+        if not late_cb.is_checked():
+            late_cb.set_checked(True)
+            attend_frame.page.wait_for_timeout(150)
+
+        minutes = str(minutes).strip()
+        if minutes:
+            minutes_field = attend_frame.locator(f'input[name="lateMinutes_{cid}"]')
+            minutes_field.wait_for(state="visible", timeout=3000)
+            minutes_field.fill(minutes)
 
     attend_frame.page.wait_for_timeout(300)
 
@@ -443,21 +466,27 @@ def run_sync(class_section, date, students):
         for period_index, period_name in enumerate(periods):
             period_key = PERIOD_KEYS[period_index]
             present_names, absent_names, excused_names = [], [], []
+            late_minutes = {}
             for student in students:
                 status = student.get("attendance", {}).get(period_key, "present")
                 if status == "absent":
                     absent_names.append(student["name"])
                 elif status == "excused":
                     excused_names.append(student["name"])
+                elif status == "late":
+                    # Late students are present -- handled entirely via
+                    # late_minutes below, not added to present_names too.
+                    late_minutes[student["name"]] = student.get("lateMinutes", {}).get(period_key, "")
                 else:
                     present_names.append(student["name"])
 
             attend_frame = select_period(page, period_name, date)
-            set_attendance_status(attend_frame, present_names, absent_names, excused_names)
+            set_attendance_status(attend_frame, present_names, absent_names, excused_names, late_minutes)
             save_period(page, attend_frame)
             results.append(
                 f"{period_name}: saved (present={len(present_names)}, "
-                f"absent={len(absent_names)}, excused={len(excused_names)})"
+                f"absent={len(absent_names)}, excused={len(excused_names)}, "
+                f"late={len(late_minutes)})"
             )
 
         # --- Phase 2: points, via Rewards tab, one student at a time ---
