@@ -28,6 +28,7 @@ Real selectors confirmed via dev-tools inspection (2026-08-26):
 """
 
 import os
+import datetime
 from playwright.sync_api import sync_playwright
 
 NIGRI_BASE_URL = "https://www.nigrijewishonlineschool.com"
@@ -53,7 +54,44 @@ CLASS_PERIODS = {
     ],
 }
 
-POINTS_PERIOD_INDEX = 3  # 0-indexed -> "Morning Class 3"
+POINTS_PERIOD_INDEX = 3  # 0-indexed -> "Morning Class 3" (or "Friday Class 3" on Fridays)
+
+# On Fridays, Davening is unchanged but Morning Class 1/2/3 don't exist as
+# selectable periods at all -- the site replaces them with Friday Class
+# 1/2/3 instead (confirmed 2026-08-28, after a sync failed looking for
+# "Morning Class 1" on a Friday and it turned out that option simply
+# wasn't in the dropdown that day). Points still go on the last one
+# (Friday Class 3), same pattern as the weekday Morning Class 3.
+FRIDAY_CLASS_PERIODS = {
+    "B3 WT": [
+        "B3 WT - Davening",
+        "B3 WT - Friday Class 1",
+        "B3 WT - Friday Class 2",
+        "B3 WT - Friday Class 3",   # <- points go here on Fridays
+    ],
+    "B3 ET": [
+        "B3 ET - Davening",
+        "B3 ET - Friday Class 1",
+        "B3 ET - Friday Class 2",
+        "B3 ET - Friday Class 3",   # <- points go here on Fridays
+    ],
+}
+
+
+def get_periods_for_date(class_section, date_str):
+    """
+    Returns the right period list (weekday vs. Friday) for a given
+    class_section + date string (expects "YYYY-MM-DD"). PERIOD_KEYS
+    still index-aligns with whichever list comes back, since both
+    lists are the same length/shape (Davening, Class 1, 2, 3).
+    """
+    if class_section not in CLASS_PERIODS:
+        raise ValueError(f"Unknown class_section: {class_section}")
+
+    parsed = datetime.datetime.strptime(date_str, "%Y-%m-%d").date()
+    is_friday = parsed.weekday() == 4  # Monday=0 ... Friday=4
+
+    return FRIDAY_CLASS_PERIODS[class_section] if is_friday else CLASS_PERIODS[class_section]
 
 # Fixed per-student childID used in Rewards tab URLs (confirmed via
 # debug_rewards_page HTML dump, 2026-08-26). Matching students by name
@@ -389,10 +427,7 @@ def debug_points_attempt(class_section, date, students):
     so we can see exactly what the automation sees at that moment,
     before any save/reload can reset/mask it.
     """
-    if class_section not in CLASS_PERIODS:
-        raise ValueError(f"Unknown class_section: {class_section}")
-
-    period_name = CLASS_PERIODS[class_section][POINTS_PERIOD_INDEX]
+    period_name = get_periods_for_date(class_section, date)[POINTS_PERIOD_INDEX]
     student_names = [s["name"] for s in students]
 
     with sync_playwright() as p:
@@ -435,10 +470,7 @@ def debug_attendance_page(class_section, date, target="attend"):
     default) -- whichever we currently need to inspect real selectors
     on, instead of guessing.
     """
-    if class_section not in CLASS_PERIODS:
-        raise ValueError(f"Unknown class_section: {class_section}")
-
-    period_name = CLASS_PERIODS[class_section][0]
+    period_name = get_periods_for_date(class_section, date)[0]
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -480,10 +512,7 @@ def run_sync(class_section, date, students):
       2. Give each student their points via the Rewards tab directly
          (see add_points_for_student) -- unchanged, confirmed working.
     """
-    if class_section not in CLASS_PERIODS:
-        raise ValueError(f"Unknown class_section: {class_section}")
-
-    periods = CLASS_PERIODS[class_section]
+    periods = get_periods_for_date(class_section, date)
     results = []
 
     with sync_playwright() as p:
