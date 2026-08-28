@@ -80,6 +80,18 @@ REWARDS_CHILD_IDS = {
 }
 
 
+class SyncError(Exception):
+    """
+    Raised when run_sync fails partway through. Carries whatever
+    periods/results were already completed successfully, so a failure
+    on (say) the 3rd period doesn't leave you guessing whether the
+    first two actually saved.
+    """
+    def __init__(self, message, partial_results=None):
+        super().__init__(message)
+        self.partial_results = partial_results or []
+
+
 def login(page):
     page.goto(NIGRI_LOGIN_URL)
     page.fill('input[name="login"]', NIGRI_USERNAME)
@@ -105,7 +117,7 @@ def get_list_frame(page):
     raise RuntimeError("Could not locate the frame containing the period picker")
 
 
-def get_attend_frame(page, timeout_ms=8000, poll_ms=300):
+def get_attend_frame(page, timeout_ms=15000, poll_ms=300):
     """
     The actual attendance checkboxes/rewards/save-button form lives in
     an iframe named "attend" (confirmed via debug HTML dump), nested
@@ -136,6 +148,22 @@ def get_attend_frame(page, timeout_ms=8000, poll_ms=300):
         frame.wait_for_selector("form#attendFrm", timeout=timeout_ms)
     except Exception:
         pass  # fall through and let the caller's own logic surface any real problem
+
+    # The form shell can exist before the student rows inside it have
+    # actually rendered -- when that happened, the very first
+    # attend_{childID} checkbox we looked for wasn't there yet and we
+    # hung for a full 30s deep inside set_attendance_status with a
+    # confusing error. Wait here instead, for an actual student
+    # checkbox, so any real problem surfaces immediately and clearly.
+    try:
+        frame.wait_for_selector('input[name^="attend_"]', timeout=timeout_ms)
+    except Exception:
+        raise RuntimeError(
+            "The 'attend' iframe loaded but no student checkboxes ever "
+            "appeared inside it (no input[name^='attend_'] found). This "
+            "usually means the period picker change didn't fully take "
+            "effect before we started looking."
+        )
 
     return frame
 
@@ -480,9 +508,13 @@ def run_sync(class_section, date, students):
                 else:
                     present_names.append(student["name"])
 
-            attend_frame = select_period(page, period_name, date)
-            set_attendance_status(attend_frame, present_names, absent_names, excused_names, late_minutes)
-            save_period(page, attend_frame)
+            try:
+                attend_frame = select_period(page, period_name, date)
+                set_attendance_status(attend_frame, present_names, absent_names, excused_names, late_minutes)
+                save_period(page, attend_frame)
+            except Exception as e:
+                raise SyncError(f"Failed during period '{period_name}': {e}", partial_results=results) from e
+
             results.append(
                 f"{period_name}: saved (present={len(present_names)}, "
                 f"absent={len(absent_names)}, excused={len(excused_names)}, "
