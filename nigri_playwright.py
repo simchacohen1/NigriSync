@@ -761,6 +761,336 @@ MARKS_GRADE_IDS = {
 }
 
 
+# Real topic IDs confirmed via debug_marks_page's HTML dump (2026-09-08)
+# -- this is the FULL master list of topic options as shown BEFORE a
+# grade is picked. Selecting a topic by its value (id) instead of its
+# visible label sidesteps the AJAX-refresh timing problem found while
+# testing (see select_topic_robust below): the ids stay the same after
+# the grade-triggered refresh even though the select's DOM node itself
+# gets rebuilt.
+MARKS_TOPIC_IDS = {
+    "A Chossid is a Lamdan": "184",
+    "Behavior": "134",
+    "Biurei Tefila": "42",
+    "Chumash": "10",
+    "Chumash Comprehension": "137",
+    "Chumash Havana": "194",
+    "Chumash Translation": "138",
+    "Chumash-HW": "163",
+    "Chumash-Rashi": "139",
+    "Class Participation": "135",
+    "Devar Torah": "11",
+    "Halacha-Yahadus": "145",
+    "Inyonei Geulo UMoshiach": "27",
+    "Kriah": "58",
+    "Niggun": "7",
+    "Parsha": "9",
+    "Programs": "167",
+    "Shoroshim": "142",
+    "Tefila": "40",
+    "Worksheets": "189",
+}
+
+
+def select_topic_robust(page, class_section, topic_label, timeout_ms=15000, poll_ms=500):
+    """
+    Picking a grade (select#testGradeID) kicks off an AJAX call that
+    repopulates select#testTopicID -- confirmed (2026-09-08, testing
+    B3 ET) to be slow/unpredictable enough that selecting a topic right
+    after picking a grade can time out entirely. Instead of one blind
+    select_option call, this polls the LIVE option list on the select
+    element until the topic we want actually shows up, then selects it
+    -- by option value when we know the topic's id (MARKS_TOPIC_IDS;
+    more reliable than label text, which is what timed out before), or
+    by label as a fallback for a topic that isn't in that map.
+    """
+    topic_id = MARKS_TOPIC_IDS.get(topic_label)
+    waited = 0
+    while waited < timeout_ms:
+        try:
+            if topic_id is not None:
+                values = page.eval_on_selector(
+                    "select#testTopicID",
+                    "el => Array.from(el.options).map(o => o.value)",
+                )
+                if topic_id in values:
+                    page.select_option("select#testTopicID", value=topic_id)
+                    return
+            else:
+                labels = page.eval_on_selector(
+                    "select#testTopicID",
+                    "el => Array.from(el.options).map(o => o.textContent.trim())",
+                )
+                if topic_label in labels:
+                    page.select_option("select#testTopicID", label=topic_label)
+                    return
+        except Exception:
+            pass  # the select may be mid-reload right now -- just keep polling
+        page.wait_for_timeout(poll_ms)
+        waited += poll_ms
+
+    # Ran out of time -- report exactly what options WERE available, so a
+    # wrong/misspelled/unavailable-for-this-grade topic is obvious
+    # instead of just a bare timeout.
+    try:
+        available = page.eval_on_selector(
+            "select#testTopicID",
+            "el => Array.from(el.options).map(o => o.textContent.trim())",
+        )
+    except Exception:
+        available = None
+    raise RuntimeError(
+        f"Topic '{topic_label}' never appeared in the topic dropdown for "
+        f"class '{class_section}' after {timeout_ms}ms. Options actually "
+        f"available: {available!r}"
+    )
+
+
+def fill_student_mark(page, name, mark=None, attendance="present", comment=None):
+    """
+    Fills in one student's row on the per-student marks screen (the
+    screen that only exists after "Create Mark!" has been submitted --
+    see run_marks_sync). Confirmed real field names via
+    debug_marks_create_and_view's HTML dump (2026-09-08):
+        testChild_{childID}_mark              (text input, the score)
+        testChild_{childID}_markSpecialStatus  (select: ''=Present,
+            '1'=Absent, '2'=N/A, '3'=Excused)
+        testChild_{childID}_markComment        (textarea)
+
+    attendance is one of "present", "absent", or "review":
+      - "present" (default): leaves markSpecialStatus at its default
+        (blank = Present) and fills in the mark, if one was given.
+      - "absent": sets markSpecialStatus to Absent and does NOT fill in
+        a mark (an absent student doesn't have a quiz score).
+      - "review": skipped entirely -- neither the mark nor the status
+        field is touched for this student, so they're left exactly as
+        "Create Mark!" set them up (blank/default), per instructions
+        not to guess at a status for these.
+    """
+    if name not in REWARDS_CHILD_IDS:
+        raise RuntimeError(f"No known childID for student: {name}")
+    cid = REWARDS_CHILD_IDS[name]
+
+    if attendance == "review":
+        return
+    if attendance not in ("present", "absent"):
+        raise ValueError(f"Unknown attendance value for {name}: {attendance!r}")
+
+    if attendance == "absent":
+        page.locator(f'select[name="testChild_{cid}_markSpecialStatus"]').select_option("1")
+    elif mark not in (None, ""):
+        mark_input = page.locator(f'input[name="testChild_{cid}_mark"]')
+        mark_input.fill(str(mark))
+        # The real field has an onchange handler (test_markFix) Nigri
+        # uses to validate/reformat what was typed -- fire a real
+        # change event so that runs, same as a person tabbing out of
+        # the box would trigger.
+        mark_input.evaluate(
+            """(el) => {
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+                el.blur();
+            }"""
+        )
+
+    if comment:
+        page.locator(f'textarea[name="testChild_{cid}_markComment"]').fill(str(comment))
+
+
+def run_marks_sync(
+    class_section,
+    topic,
+    test_name,
+    students,
+    mark_type="quiz",
+    test_date=None,
+    description=None,
+    mark_all_done=True,
+):
+    """
+    The real, production version of the School Marks push -- the quiz
+    equivalent of run_sync() for attendance/points. One browser session:
+      1. Create a new mark (header form): grade, topic, type, name, and
+         optionally a date/description.
+      2. Fill in each student's score/status/comment on the resulting
+         per-student screen (see fill_student_mark).
+      3. Mark the whole thing "Marking done" (unless mark_all_done is
+         False) and submit the real final Save!.
+
+    Unlike the debug create-and-delete function, this does NOT delete
+    the mark afterward -- this is the real thing being pushed to the
+    gradebook, meant to stay there.
+
+    class_section: "B3 ET" or "B3 WT".
+    topic: a real topic label -- see MARKS_TOPIC_IDS for the confirmed
+      list (e.g. "Chumash", "Parsha", "Shoroshim", ...).
+    test_name: the mark's title, shown in Nigri's mark list.
+    students: [{"name": ..., "mark": ..., "attendance": "present" |
+      "absent" | "review", "comment": (optional)}, ...] -- "name" must
+      be a key in REWARDS_CHILD_IDS.
+    mark_type: one of "homework", "test", "quiz", "classwork".
+    """
+    if class_section not in MARKS_GRADE_IDS:
+        raise ValueError(f"Unknown class_section: {class_section}")
+    if mark_type not in ("homework", "test", "quiz", "classwork"):
+        raise ValueError(f"Unknown mark_type: {mark_type}")
+
+    results = []
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+
+        login(page)
+        page.goto(MARKS_URL)
+        page.wait_for_load_state("networkidle")
+
+        try:
+            page.click("text=Create New Mark", timeout=5000)
+            page.wait_for_load_state("networkidle")
+        except Exception as e:
+            raise SyncError(f"Could not open 'Create New Mark': {e}", partial_results=results) from e
+
+        try:
+            page.select_option("select#testGradeID", label=class_section)
+            page.wait_for_load_state("networkidle")
+            page.wait_for_timeout(1000)  # let the topic-list AJAX refresh land
+        except Exception as e:
+            raise SyncError(f"Could not select grade '{class_section}': {e}", partial_results=results) from e
+
+        try:
+            select_topic_robust(page, class_section, topic)
+        except Exception as e:
+            raise SyncError(f"Could not select topic '{topic}': {e}", partial_results=results) from e
+
+        try:
+            page.check(f"input#testType_{mark_type}")
+        except Exception as e:
+            raise SyncError(f"Could not select mark type '{mark_type}': {e}", partial_results=results) from e
+
+        try:
+            page.fill('input[name="testName"]', test_name)
+        except Exception as e:
+            raise SyncError(f"Could not fill in the mark name: {e}", partial_results=results) from e
+
+        if test_date:
+            try:
+                page.fill('input[name="testDate"]', test_date)
+            except Exception as e:
+                raise SyncError(f"Could not fill in the date: {e}", partial_results=results) from e
+
+        if description:
+            try:
+                page.fill('textarea[name="testDesc"]', description)
+            except Exception as e:
+                raise SyncError(f"Could not fill in the description: {e}", partial_results=results) from e
+
+        try:
+            page.click('input[type="submit"][value="Create Mark!"]')
+            page.wait_for_load_state("networkidle")
+            page.wait_for_timeout(500)
+        except Exception as e:
+            raise SyncError(f"Could not submit 'Create Mark!': {e}", partial_results=results) from e
+
+        landed_on_url = page.url
+        match = re.search(r"testID=(\d+)", landed_on_url)
+        test_id = match.group(1) if match else None
+        if not test_id or test_id == "0":
+            raise SyncError(
+                f"Mark was submitted but no real testID came back in the URL "
+                f"({landed_on_url}) -- stopping before touching any student rows.",
+                partial_results=results,
+            )
+        results.append(f"Mark created (testID={test_id})")
+
+        for student in students:
+            name = student["name"]
+            attendance = student.get("attendance", "present")
+            try:
+                fill_student_mark(
+                    page,
+                    name=name,
+                    mark=student.get("mark"),
+                    attendance=attendance,
+                    comment=student.get("comment"),
+                )
+                results.append(f"{name}: filled (attendance={attendance})")
+            except Exception as e:
+                results.append(f"{name}: FAILED - {e}")
+
+        if mark_all_done:
+            try:
+                page.select_option("select#testCompleted", value="1")
+            except Exception as e:
+                results.append(f"Could not set 'Marking done': {e}")
+
+        try:
+            page.click('input[type="submit"][value="Save!"]')
+            page.wait_for_load_state("networkidle")
+            page.wait_for_timeout(500)
+            results.append("Final Save! submitted")
+        except Exception as e:
+            raise SyncError(
+                f"Mark {test_id} was created and student rows were filled, but "
+                f"the final Save! failed: {e}",
+                partial_results=results,
+            ) from e
+
+        browser.close()
+
+    return {"test_id": test_id, "results": results}
+
+
+def debug_marks_full_flow(
+    class_section,
+    topic,
+    test_name="ZZZ_DEBUG_DELETE_ME",
+    mark_type="quiz",
+    test_date=None,
+    students=None,
+    delete_after=True,
+):
+    """
+    Runs the REAL production run_marks_sync() end-to-end (create mark,
+    fill student row(s), click the real final Save!) against an
+    obviously-fake test_name -- then, if delete_after is true (the
+    default), deletes that test mark afterward the same way
+    debug_marks_create_and_view does. This is the safe way to test the
+    WHOLE real flow (topic-selection fix included) with a real-shaped
+    student before wiring this up to a real quiz's data.
+
+    Defaults to one harmless test student if none is given.
+    """
+    if not students:
+        students = [{"name": "Chaikin Mayer Chaim", "mark": "9", "attendance": "present", "comment": "test"}]
+
+    sync_result = run_marks_sync(
+        class_section=class_section,
+        topic=topic,
+        test_name=test_name,
+        students=students,
+        mark_type=mark_type,
+        test_date=test_date,
+    )
+
+    test_id = sync_result.get("test_id")
+    delete_result = None
+    if delete_after and test_id:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            login(page)
+            del_url = (
+                f"{NIGRI_BASE_URL}/main/default_os_prog.asp"
+                f"?section=teachers&spec=tests&action=del_test&testID={test_id}"
+            )
+            page.goto(del_url)
+            page.wait_for_load_state("networkidle")
+            delete_result = {"ok": True, "test_id": test_id, "final_url": page.url}
+            browser.close()
+
+    return {**sync_result, "delete_result": delete_result}
+
+
 def debug_marks_create_and_view(
     class_section,
     topic_label,
