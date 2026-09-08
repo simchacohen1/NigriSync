@@ -28,6 +28,7 @@ Real selectors confirmed via dev-tools inspection (2026-08-26):
 """
 
 import os
+import base64
 import datetime
 from playwright.sync_api import sync_playwright
 
@@ -35,6 +36,13 @@ NIGRI_BASE_URL = "https://www.nigrijewishonlineschool.com"
 NIGRI_LOGIN_URL = f"{NIGRI_BASE_URL}/main/default_os_prog.asp?section=teachers"
 NIGRI_USERNAME = os.environ.get("NIGRI_USERNAME")
 NIGRI_PASSWORD = os.environ.get("NIGRI_PASSWORD")
+
+# UNCONFIRMED -- carried over from the browser-extension version of this
+# project (nigricontent.js / background.js), which guessed this URL for
+# the School Marks / Tests section and never got to test it against the
+# live site either. This is exactly what debug_marks_page() below exists
+# to confirm or correct.
+MARKS_URL = f"{NIGRI_BASE_URL}/main/default_os_prog.asp?section=teachers&subSection=tests&side=1"
 
 # Confirmed real period names/order from the "Attendance for" dropdown
 # (2026-08-26). Friday Class 1/2/3 exist too but are skipped here since
@@ -652,4 +660,81 @@ def debug_rewards_page(student_name=None):
     return {
         "rewards_list_html": rewards_list_html,
         "student_page_html": student_page_html,
+    }
+
+
+def debug_marks_page(click_texts=None, screenshot=False):
+    """
+    Diagnostic ONLY -- this is the discovery step for School Marks/quiz
+    marks, the same way debug_attendance_page/debug_rewards_page were
+    used to nail down the real selectors for Attendance and Rewards.
+    NOTHING about the marks flow below has been confirmed against the
+    live site yet.
+
+    Logs in, goes to MARKS_URL (currently just a guess -- see the note
+    above it), then optionally clicks through a sequence of link/button
+    texts one at a time (e.g. click_texts=["Create New Mark"]) to reach
+    a deeper screen. After that, it dumps:
+      - every frame's name, URL, and full HTML (the main page counts as
+        one "frame" with name None) -- Attendance turned out to live in
+        a nested iframe named "attend", so this grabs everything rather
+        than assuming Marks does or doesn't work the same way
+      - optionally a full-page screenshot (base64-encoded PNG), which
+        can be quicker to eyeball than raw HTML for figuring out what
+        screen we actually landed on
+
+    Safety: this never clicks anything resembling a save/submit control
+    on its own -- only whatever exact text you pass in click_texts, and
+    if any click in the sequence fails to find a match, it stops there
+    (recorded in click_results) rather than guessing at what comes next.
+    Landing on a blank "create new mark" form is expected to be safe
+    (nothing persists until an actual Save is clicked), but reaching the
+    per-student marks table appears -- going by the old browser-extension
+    code -- to require submitting that header form first, which IS a
+    real save on Nigri's side. That's deliberately a separate, later,
+    opt-in step (do it once with an obviously-fake test title/date so
+    it's easy to find and delete), not something this function does.
+    """
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+
+        login(page)
+        page.goto(MARKS_URL)
+        page.wait_for_load_state("networkidle")
+
+        click_results = []
+        for text in (click_texts or []):
+            try:
+                page.click(f"text={text}", timeout=5000)
+                page.wait_for_load_state("networkidle")
+                page.wait_for_timeout(500)
+                click_results.append({"text": text, "ok": True})
+            except Exception as e:
+                click_results.append({"text": text, "ok": False, "error": str(e)})
+                break  # later clicks are probably meaningless if this one failed
+
+        main_url = page.url
+
+        frames_dump = []
+        for frame in page.frames:
+            entry = {"name": frame.name, "url": frame.url}
+            try:
+                entry["html"] = frame.content()
+            except Exception as e:
+                entry["error"] = str(e)
+            frames_dump.append(entry)
+
+        screenshot_b64 = None
+        if screenshot:
+            screenshot_b64 = base64.b64encode(page.screenshot(full_page=True)).decode("ascii")
+
+        browser.close()
+
+    return {
+        "marks_url_used": MARKS_URL,
+        "landed_on_url": main_url,
+        "click_results": click_results,
+        "frames": frames_dump,
+        "screenshot_b64": screenshot_b64,
     }

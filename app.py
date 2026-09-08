@@ -19,6 +19,7 @@ from nigri_playwright import (
     debug_attendance_page,
     debug_points_attempt,
     debug_rewards_page,
+    debug_marks_page,
     SyncError,
 )
 
@@ -124,6 +125,41 @@ def debug_rewards():
 
     try:
         result = debug_rewards_page(student_name=student_name)
+        return jsonify({"status": "success", **result})
+    except Exception as e:
+        return jsonify({"status": "error", "detail": str(e)}), 500
+
+
+@app.route("/debug-marks", methods=["GET", "POST"])
+def debug_marks():
+    # --- auth check ---
+    # GET is here specifically so this can be triggered by just pasting a
+    # URL into a browser's address bar -- no terminal/curl needed. The key
+    # goes in the URL itself (?key=...) for GET, or the X-Sync-Key header
+    # for POST (used by the other debug endpoints / the real sync later).
+    provided_key = request.headers.get("X-Sync-Key") or request.args.get("key")
+    if not SYNC_API_KEY or provided_key != SYNC_API_KEY:
+        return jsonify({"error": "unauthorized"}), 401
+
+    if request.method == "POST":
+        body = request.get_json(force=True, silent=True) or {}
+        click_texts = body.get("click_texts", ["Create New Mark"])
+        screenshot = bool(body.get("screenshot", False))
+    else:
+        # GET: ?click=Create New Mark,Some Other Button  (comma-separated)
+        # ?click=  (empty) means "click nothing, just show the overview"
+        # &screenshot=1 includes a base64 screenshot in the JSON
+        raw_click = request.args.get("click")
+        if raw_click is None:
+            click_texts = ["Create New Mark"]
+        elif raw_click.strip() == "":
+            click_texts = []
+        else:
+            click_texts = [t.strip() for t in raw_click.split(",") if t.strip()]
+        screenshot = request.args.get("screenshot") in ("1", "true", "True")
+
+    try:
+        result = debug_marks_page(click_texts=click_texts, screenshot=screenshot)
         return jsonify({"status": "success", **result})
     except Exception as e:
         return jsonify({"status": "error", "detail": str(e)}), 500
