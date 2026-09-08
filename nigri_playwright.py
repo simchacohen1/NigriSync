@@ -28,6 +28,7 @@ Real selectors confirmed via dev-tools inspection (2026-08-26):
 """
 
 import os
+import re
 import base64
 import datetime
 from playwright.sync_api import sync_playwright
@@ -663,6 +664,24 @@ def debug_rewards_page(student_name=None):
     }
 
 
+def _dump_all_frames(page):
+    """
+    Shared helper: returns [{name, url, html}] for every frame currently
+    on the page (the main page counts as one frame with name ""). Used
+    by both Marks debug functions so we never miss content that turns
+    out to live in a nested iframe, the way Attendance's did.
+    """
+    frames_dump = []
+    for frame in page.frames:
+        entry = {"name": frame.name, "url": frame.url}
+        try:
+            entry["html"] = frame.content()
+        except Exception as e:
+            entry["error"] = str(e)
+        frames_dump.append(entry)
+    return frames_dump
+
+
 def debug_marks_page(click_texts=None, screenshot=False):
     """
     Diagnostic ONLY -- this is the discovery step for School Marks/quiz
@@ -693,7 +712,7 @@ def debug_marks_page(click_texts=None, screenshot=False):
     code -- to require submitting that header form first, which IS a
     real save on Nigri's side. That's deliberately a separate, later,
     opt-in step (do it once with an obviously-fake test title/date so
-    it's easy to find and delete), not something this function does.
+    it's easy to find and delete) -- see debug_marks_create_and_view().
     """
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -715,15 +734,7 @@ def debug_marks_page(click_texts=None, screenshot=False):
                 break  # later clicks are probably meaningless if this one failed
 
         main_url = page.url
-
-        frames_dump = []
-        for frame in page.frames:
-            entry = {"name": frame.name, "url": frame.url}
-            try:
-                entry["html"] = frame.content()
-            except Exception as e:
-                entry["error"] = str(e)
-            frames_dump.append(entry)
+        frames_dump = _dump_all_frames(page)
 
         screenshot_b64 = None
         if screenshot:
@@ -737,4 +748,167 @@ def debug_marks_page(click_texts=None, screenshot=False):
         "click_results": click_results,
         "frames": frames_dump,
         "screenshot_b64": screenshot_b64,
+    }
+
+
+# Real grade IDs confirmed via debug_marks_page HTML dump (2026-09-08).
+# select_option can also match by visible label text directly, so these
+# aren't strictly required, but kept here since we now know them for
+# certain and they may be useful later (e.g. for direct-URL navigation).
+MARKS_GRADE_IDS = {
+    "B3 ET": "22590",
+    "B3 WT": "22453",
+}
+
+
+def debug_marks_create_and_view(
+    class_section,
+    topic_label,
+    mark_type="quiz",
+    test_name="ZZZ_DEBUG_DELETE_ME",
+    test_date=None,
+    delete_after=True,
+    screenshot=False,
+):
+    """
+    Diagnostic step 2 for School Marks. UNLIKE debug_marks_page, this one
+    DOES write to the real Nigri site: it fills in the real header form
+    (confirmed via debug_marks_page -- select#testGradeID, #testTopicID,
+    input#testType_{homework|test|quiz|classwork}, input[name=testDate],
+    input[name=testName], textarea[name=testDesc]) with obviously-fake
+    test values, clicks "Create Mark!", and captures whatever the
+    resulting per-student marks screen looks like -- that screen's real
+    field names are the one thing debug_marks_page couldn't reach, since
+    getting there requires an actual save.
+
+    class_section must be "B3 ET" or "B3 WT" (the real dropdown text).
+    topic_label must match one of the real topic option texts (e.g.
+    "Chumash", "Shoroshim", "Parsha", "Chumash Comprehension", ...) --
+    see debug_marks_page's dumped HTML for the full confirmed list.
+    mark_type must be one of "homework", "test", "quiz", "classwork".
+
+    Safety: if delete_after is true (the default), this finds the new
+    testID from the post-save URL and immediately deletes that same test
+    mark by hitting the same URL Nigri's own "delete test" link uses
+    (tests_delTest() in their JS: ...&action=del_test&testID=...), so the
+    obviously-fake entry doesn't linger in the real gradebook. Every step
+    is recorded in "steps" regardless of whether it succeeded, so a
+    failure partway through still tells us exactly how far it got.
+    """
+    steps = []
+
+    def record(name, ok, detail=None):
+        entry = {"step": name, "ok": ok}
+        if detail is not None:
+            entry["detail"] = detail
+        steps.append(entry)
+
+    landed_on_url = None
+    test_id = None
+    frames_dump = []
+    screenshot_b64 = None
+    delete_result = None
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+
+        login(page)
+        page.goto(MARKS_URL)
+        page.wait_for_load_state("networkidle")
+
+        try:
+            page.click("text=Create New Mark", timeout=5000)
+            page.wait_for_load_state("networkidle")
+            record("click_create_new_mark", True)
+        except Exception as e:
+            record("click_create_new_mark", False, str(e))
+            frames_dump = _dump_all_frames(page)
+            browser.close()
+            return {"steps": steps, "aborted": True, "frames": frames_dump}
+
+        try:
+            page.select_option("select#testGradeID", label=class_section)
+            page.wait_for_load_state("networkidle")
+            # Selecting the grade triggers an AJAX call that repopulates
+            # the topic dropdown -- give it a beat to land before we try
+            # to select a topic from it.
+            page.wait_for_timeout(1000)
+            record("select_grade", True, class_section)
+        except Exception as e:
+            record("select_grade", False, str(e))
+
+        try:
+            page.select_option("select#testTopicID", label=topic_label)
+            record("select_topic", True, topic_label)
+        except Exception as e:
+            record("select_topic", False, str(e))
+
+        try:
+            page.check(f"input#testType_{mark_type}")
+            record("select_type", True, mark_type)
+        except Exception as e:
+            record("select_type", False, str(e))
+
+        try:
+            page.fill('input[name="testName"]', test_name)
+            record("fill_name", True, test_name)
+        except Exception as e:
+            record("fill_name", False, str(e))
+
+        if test_date:
+            try:
+                page.fill('input[name="testDate"]', test_date)
+                record("fill_date", True, test_date)
+            except Exception as e:
+                record("fill_date", False, str(e))
+
+        try:
+            page.click('input[type="submit"][value="Create Mark!"]')
+            page.wait_for_load_state("networkidle")
+            page.wait_for_timeout(500)
+            record("submit_create", True)
+        except Exception as e:
+            record("submit_create", False, str(e))
+            frames_dump = _dump_all_frames(page)
+            browser.close()
+            return {"steps": steps, "aborted": True, "frames": frames_dump}
+
+        landed_on_url = page.url
+        match = re.search(r"testID=(\d+)", landed_on_url)
+        test_id = match.group(1) if match else None
+        record("extract_test_id", bool(test_id) and test_id != "0", test_id)
+
+        frames_dump = _dump_all_frames(page)
+
+        if screenshot:
+            screenshot_b64 = base64.b64encode(page.screenshot(full_page=True)).decode("ascii")
+
+        if delete_after:
+            if test_id and test_id != "0":
+                try:
+                    del_url = (
+                        f"{NIGRI_BASE_URL}/main/default_os_prog.asp"
+                        f"?section=teachers&spec=tests&action=del_test&testID={test_id}"
+                    )
+                    page.goto(del_url)
+                    page.wait_for_load_state("networkidle")
+                    delete_result = {"ok": True, "test_id": test_id, "final_url": page.url}
+                    record("delete_test", True, test_id)
+                except Exception as e:
+                    delete_result = {"ok": False, "test_id": test_id, "error": str(e)}
+                    record("delete_test", False, str(e))
+            else:
+                delete_result = {"ok": False, "reason": "no test_id found in URL -- nothing deleted"}
+                record("delete_test", False, "no test_id found")
+
+        browser.close()
+
+    return {
+        "steps": steps,
+        "landed_on_url": landed_on_url,
+        "test_id": test_id,
+        "frames": frames_dump,
+        "screenshot_b64": screenshot_b64,
+        "delete_result": delete_result,
     }

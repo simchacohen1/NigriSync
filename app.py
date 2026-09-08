@@ -20,6 +20,7 @@ from nigri_playwright import (
     debug_points_attempt,
     debug_rewards_page,
     debug_marks_page,
+    debug_marks_create_and_view,
     SyncError,
 )
 
@@ -160,6 +161,53 @@ def debug_marks():
 
     try:
         result = debug_marks_page(click_texts=click_texts, screenshot=screenshot)
+        return jsonify({"status": "success", **result})
+    except Exception as e:
+        return jsonify({"status": "error", "detail": str(e)}), 500
+
+
+@app.route("/debug-marks-create", methods=["GET", "POST"])
+def debug_marks_create():
+    # --- auth check ---
+    # WARNING: unlike every other /debug-* endpoint, this one writes a
+    # real (obviously-fake) mark to the live Nigri site, then deletes it
+    # again by default. See debug_marks_create_and_view()'s docstring.
+    provided_key = request.headers.get("X-Sync-Key") or request.args.get("key")
+    if not SYNC_API_KEY or provided_key != SYNC_API_KEY:
+        return jsonify({"error": "unauthorized"}), 401
+
+    if request.method == "POST":
+        body = request.get_json(force=True, silent=True) or {}
+        class_section = body.get("class_section", "B3 ET")
+        topic_label = body.get("topic", "Chumash")
+        mark_type = body.get("type", "quiz")
+        test_name = body.get("name", "ZZZ_DEBUG_DELETE_ME")
+        test_date = body.get("date")
+        delete_after = bool(body.get("delete", True))
+        screenshot = bool(body.get("screenshot", False))
+    else:
+        # GET, so this can be triggered by pasting a URL into a browser:
+        #   /debug-marks-create?key=...
+        #   &class=B3 ET&topic=Chumash&type=quiz&name=ZZZ_DEBUG_DELETE_ME
+        #   &delete=1&screenshot=0
+        class_section = request.args.get("class", "B3 ET")
+        topic_label = request.args.get("topic", "Chumash")
+        mark_type = request.args.get("type", "quiz")
+        test_name = request.args.get("name", "ZZZ_DEBUG_DELETE_ME")
+        test_date = request.args.get("date")
+        delete_after = request.args.get("delete", "1") in ("1", "true", "True")
+        screenshot = request.args.get("screenshot") in ("1", "true", "True")
+
+    try:
+        result = debug_marks_create_and_view(
+            class_section=class_section,
+            topic_label=topic_label,
+            mark_type=mark_type,
+            test_name=test_name,
+            test_date=test_date,
+            delete_after=delete_after,
+            screenshot=screenshot,
+        )
         return jsonify({"status": "success", **result})
     except Exception as e:
         return jsonify({"status": "error", "detail": str(e)}), 500
