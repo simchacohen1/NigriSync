@@ -1019,7 +1019,10 @@ def run_marks_sync(
 
         if mark_all_done:
             try:
-                page.select_option("select#testCompleted", value="1")
+                # Confirmed via debug_marks_create_and_view's HTML dump
+                # (2026-09-08) that this field has no id -- it must be
+                # targeted by its name attribute, not select#testCompleted.
+                page.select_option('select[name="testCompleted"]', value="1")
             except Exception as e:
                 results.append(f"Could not set 'Marking done': {e}")
 
