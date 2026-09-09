@@ -864,10 +864,13 @@ def fill_student_mark(page, name, mark=None, attendance="present", comment=None,
         (blank = Present) and fills in the mark, if one was given.
       - "absent": sets markSpecialStatus to Absent and does NOT fill in
         a mark (an absent student doesn't have a quiz score).
-      - "review": skipped entirely -- neither the mark nor the status
-        field is touched for this student, so they're left exactly as
-        "Create Mark!" set them up (blank/default), per instructions
-        not to guess at a status for these.
+      - "review": leaves the status field untouched (blank/default),
+        same as "present", so nothing is guessed about Present vs
+        Absent for this student. Unlike before, "review" no longer
+        skips the whole row -- the mark and comment are independent of
+        attendance status, and a student with no completed attempt
+        still needs his 0 mark and his quiz-link comment filled in even
+        while his attendance is left unresolved.
 
     report_base64, if given, is a base64-encoded PDF (the per-student
     question-by-question report generated client-side in
@@ -879,14 +882,14 @@ def fill_student_mark(page, name, mark=None, attendance="present", comment=None,
         raise RuntimeError(f"No known childID for student: {name}")
     cid = REWARDS_CHILD_IDS[name]
 
-    if attendance == "review":
-        return
-    if attendance not in ("present", "absent"):
+    if attendance not in ("present", "absent", "review"):
         raise ValueError(f"Unknown attendance value for {name}: {attendance!r}")
 
     if attendance == "absent":
         page.locator(f'select[name="testChild_{cid}_markSpecialStatus"]').select_option("1")
     elif mark not in (None, ""):
+        # "present" or "review" -- review only leaves the status select
+        # untouched, it no longer bails out of filling the mark/comment.
         mark_input = page.locator(f'input[name="testChild_{cid}_mark"]')
         mark_input.fill(str(mark))
         # The real field has an onchange handler (test_markFix) Nigri
@@ -900,6 +903,9 @@ def fill_student_mark(page, name, mark=None, attendance="present", comment=None,
             }"""
         )
 
+    # Filled regardless of attendance status -- a missing student's
+    # quiz-link comment must go through even while his attendance is
+    # left on "review", and an absent student may still want the note.
     if comment:
         page.locator(f'textarea[name="testChild_{cid}_markComment"]').fill(str(comment))
 
