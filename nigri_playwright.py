@@ -846,7 +846,7 @@ def select_topic_robust(page, class_section, topic_label, timeout_ms=15000, poll
     )
 
 
-def fill_student_mark(page, name, mark=None, attendance="present", comment=None):
+def fill_student_mark(page, name, mark=None, attendance="present", comment=None, report_base64=None, report_filename=None):
     """
     Fills in one student's row on the per-student marks screen (the
     screen that only exists after "Create Mark!" has been submitted --
@@ -856,6 +856,8 @@ def fill_student_mark(page, name, mark=None, attendance="present", comment=None)
         testChild_{childID}_markSpecialStatus  (select: ''=Present,
             '1'=Absent, '2'=N/A, '3'=Excused)
         testChild_{childID}_markComment        (textarea)
+        testChild_{childID}_File1              (file upload, one of
+            File1/File2/File3 -- only File1 is used here)
 
     attendance is one of "present", "absent", or "review":
       - "present" (default): leaves markSpecialStatus at its default
@@ -866,6 +868,12 @@ def fill_student_mark(page, name, mark=None, attendance="present", comment=None)
         field is touched for this student, so they're left exactly as
         "Create Mark!" set them up (blank/default), per instructions
         not to guess at a status for these.
+
+    report_base64, if given, is a base64-encoded PDF (the per-student
+    question-by-question report generated client-side in
+    B3SchoolMarksBridge.html) attached directly into the real File1
+    upload field -- no temp file needed, Playwright can attach an
+    in-memory buffer straight to a file input.
     """
     if name not in REWARDS_CHILD_IDS:
         raise RuntimeError(f"No known childID for student: {name}")
@@ -894,6 +902,13 @@ def fill_student_mark(page, name, mark=None, attendance="present", comment=None)
 
     if comment:
         page.locator(f'textarea[name="testChild_{cid}_markComment"]').fill(str(comment))
+
+    if report_base64:
+        page.locator(f'input[name="testChild_{cid}_File1"]').set_input_files({
+            "name": report_filename or f"{name} - report.pdf",
+            "mimeType": "application/pdf",
+            "buffer": base64.b64decode(report_base64),
+        })
 
 
 def run_marks_sync(
@@ -1012,6 +1027,8 @@ def run_marks_sync(
                     mark=student.get("mark"),
                     attendance=attendance,
                     comment=student.get("comment"),
+                    report_base64=student.get("report_base64"),
+                    report_filename=student.get("report_filename"),
                 )
                 results.append(f"{name}: filled (attendance={attendance})")
             except Exception as e:
@@ -1043,6 +1060,23 @@ def run_marks_sync(
     return {"test_id": test_id, "results": results}
 
 
+# A tiny, valid, hand-built one-page PDF ("TEST REPORT ATTACHMENT") used
+# ONLY by debug_marks_full_flow's with_report option, to safely confirm
+# Playwright's set_input_files() (used by fill_student_mark for the real
+# per-student report upload) actually works against Nigri's real File1
+# field before trusting it with real quiz reports.
+_TEST_REPORT_PDF_BASE64 = (
+    "JVBERi0xLjQKMSAwIG9iajw8L1R5cGUvQ2F0YWxvZy9QYWdlcyAyIDAgUj4+ZW5kb2JqCjIgMCBv"
+    "Ymo8PC9UeXBlL1BhZ2VzL0tpZHNbMyAwIFJdL0NvdW50IDE+PmVuZG9iagozIDAgb2JqPDwvVHlw"
+    "ZS9QYWdlL1BhcmVudCAyIDAgUi9NZWRpYUJveFswIDAgMjAwIDEwMF0vUmVzb3VyY2VzPDwvRm9u"
+    "dDw8L0YxIDQgMCBSPj4+Pi9Db250ZW50cyA1IDAgUj4+ZW5kb2JqCjQgMCBvYmo8PC9UeXBlL0Zv"
+    "bnQvU3VidHlwZS9UeXBlMS9CYXNlRm9udC9IZWx2ZXRpY2E+PmVuZG9iago1IDAgb2JqPDwvTGVu"
+    "Z3RoIDYyPj5zdHJlYW0KQlQgL0YxIDEyIFRmIDIwIDYwIFRkIChURVNUIFJFUE9SVCBBVFRBQ0hN"
+    "RU5UKSBUaiBFVAplbmRzdHJlYW0KZW5kb2JqCnhyZWYKMCA2CjAwMDAwMDAwMDAgNjU1MzUgZiAK"
+    "dHJhaWxlcjw8L1NpemUgNi9Sb290IDEgMCBSPj4Kc3RhcnR4cmVmCjAKJSVFT0Y="
+)
+
+
 def debug_marks_full_flow(
     class_section,
     topic,
@@ -1051,6 +1085,7 @@ def debug_marks_full_flow(
     test_date=None,
     students=None,
     delete_after=True,
+    with_report=False,
 ):
     """
     Runs the REAL production run_marks_sync() end-to-end (create mark,
@@ -1061,10 +1096,16 @@ def debug_marks_full_flow(
     WHOLE real flow (topic-selection fix included) with a real-shaped
     student before wiring this up to a real quiz's data.
 
-    Defaults to one harmless test student if none is given.
+    Defaults to one harmless test student if none is given. If
+    with_report is true and no students were given, attaches the tiny
+    test PDF above to that default student, to confirm the file-upload
+    step itself works before trusting it with a real generated report.
     """
     if not students:
         students = [{"name": "Chaikin Mayer Chaim", "mark": "9", "attendance": "present", "comment": "test"}]
+        if with_report:
+            students[0]["report_base64"] = _TEST_REPORT_PDF_BASE64
+            students[0]["report_filename"] = "test-report-attachment.pdf"
 
     sync_result = run_marks_sync(
         class_section=class_section,

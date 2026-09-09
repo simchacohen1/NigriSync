@@ -296,11 +296,12 @@ def debug_marks_full():
         delete_after = bool(body.get("delete", True))
         student_name = body.get("student", "Chaikin Mayer Chaim")
         student_mark = body.get("mark", "9")
+        with_report = bool(body.get("with_report", False))
     else:
         # GET, so this can be triggered by pasting a URL into a browser:
         #   /debug-marks-full?key=...
         #   &class=B3 ET&topic=Chumash&type=quiz&name=ZZZ_DEBUG_DELETE_ME
-        #   &student=Chaikin Mayer Chaim&mark=9&delete=1
+        #   &student=Chaikin Mayer Chaim&mark=9&delete=1&with_report=1
         class_section = request.args.get("class", "B3 ET")
         topic = request.args.get("topic", "Chumash")
         mark_type = request.args.get("type", "quiz")
@@ -309,20 +310,26 @@ def debug_marks_full():
         delete_after = request.args.get("delete", "1") in ("1", "true", "True")
         student_name = request.args.get("student", "Chaikin Mayer Chaim")
         student_mark = request.args.get("mark", "9")
+        with_report = request.args.get("with_report") in ("1", "true", "True")
 
     try:
+        student = {
+            "name": student_name,
+            "mark": student_mark,
+            "attendance": "present",
+            "comment": "test",
+        }
+        if with_report:
+            from nigri_playwright import _TEST_REPORT_PDF_BASE64
+            student["report_base64"] = _TEST_REPORT_PDF_BASE64
+            student["report_filename"] = "test-report-attachment.pdf"
         result = debug_marks_full_flow(
             class_section=class_section,
             topic=topic,
             test_name=test_name,
             mark_type=mark_type,
             test_date=test_date,
-            students=[{
-                "name": student_name,
-                "mark": student_mark,
-                "attendance": "present",
-                "comment": "test",
-            }],
+            students=[student],
             delete_after=delete_after,
         )
         return jsonify({"status": "success", **result})
