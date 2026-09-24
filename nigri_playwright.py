@@ -28,8 +28,6 @@ Real selectors confirmed via dev-tools inspection (2026-08-26):
 """
 
 import os
-import re
-import base64
 import datetime
 from playwright.sync_api import sync_playwright
 
@@ -37,13 +35,6 @@ NIGRI_BASE_URL = "https://www.nigrijewishonlineschool.com"
 NIGRI_LOGIN_URL = f"{NIGRI_BASE_URL}/main/default_os_prog.asp?section=teachers"
 NIGRI_USERNAME = os.environ.get("NIGRI_USERNAME")
 NIGRI_PASSWORD = os.environ.get("NIGRI_PASSWORD")
-
-# UNCONFIRMED -- carried over from the browser-extension version of this
-# project (nigricontent.js / background.js), which guessed this URL for
-# the School Marks / Tests section and never got to test it against the
-# live site either. This is exactly what debug_marks_page() below exists
-# to confirm or correct.
-MARKS_URL = f"{NIGRI_BASE_URL}/main/default_os_prog.asp?section=teachers&subSection=tests&side=1"
 
 # Confirmed real period names/order from the "Attendance for" dropdown
 # (2026-08-26). Friday Class 1/2/3 exist too but are skipped here since
@@ -512,17 +503,32 @@ PERIOD_KEYS = ["davening", "class1", "class2", "class3"]
 
 def run_sync(class_section, date, students):
     """
-    One button, two phases, one browser session:
-      1. For each of the 4 periods, mark each student Present, Absent,
-         or Excused per that student's OWN per-period status (sent from
-         sync.html as student["attendance"][period_key]) -- see
-         set_attendance_status. Replaces the old behavior of blindly
-         marking everyone Present every period.
-      2. Give each student their points via the Rewards tab directly
-         (see add_points_for_student) -- unchanged, confirmed working.
+    One button, one browser session, with partial-sync support.
+
+    Backward compatibility:
+      - Old clients send all four attendance keys plus ``points`` and
+        therefore still sync everything exactly as before.
+      - New clients may OMIT any attendance period key and/or omit the
+        ``points`` field. Omitted items are skipped completely and are
+        never opened or saved on Nigri.
+
+    This makes it safe for the front end to sync only Davening, one
+    class period, points, or any combination of those items.
     """
     periods = get_periods_for_date(class_section, date)
     results = []
+
+    # A period is selected when at least one student payload explicitly
+    # contains that attendance key. The current front end sends the same
+    # selected keys for every student, but using ``any`` keeps this robust.
+    selected_period_keys = [
+        key for key in PERIOD_KEYS
+        if any(key in student.get("attendance", {}) for student in students)
+    ]
+    sync_points = any("points" in student for student in students)
+
+    if not selected_period_keys and not sync_points:
+        raise SyncError("Nothing was selected to sync.")
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -530,21 +536,27 @@ def run_sync(class_section, date, students):
 
         login(page)
 
-        # --- Phase 1: attendance, per period, per-student status ---
-        go_to_attendance_tab(page)
+        # --- Phase 1: only the selected attendance periods ---
+        if selected_period_keys:
+            go_to_attendance_tab(page)
+
         for period_index, period_name in enumerate(periods):
             period_key = PERIOD_KEYS[period_index]
+            if period_key not in selected_period_keys:
+                continue
+
             present_names, absent_names, excused_names = [], [], []
             late_minutes = {}
             for student in students:
+                # Because this period was selected, every student should
+                # normally have an explicit status. Defaulting to present
+                # preserves compatibility with any older/partial payload.
                 status = student.get("attendance", {}).get(period_key, "present")
                 if status == "absent":
                     absent_names.append(student["name"])
                 elif status == "excused":
                     excused_names.append(student["name"])
                 elif status == "late":
-                    # Late students are present -- handled entirely via
-                    # late_minutes below, not added to present_names too.
                     late_minutes[student["name"]] = student.get("lateMinutes", {}).get(period_key, "")
                 else:
                     present_names.append(student["name"])
@@ -562,15 +574,18 @@ def run_sync(class_section, date, students):
                 f"late={len(late_minutes)})"
             )
 
-        # --- Phase 2: points, via Rewards tab, one student at a time ---
-        for student in students:
-            name = student["name"]
-            points = student["points"]
-            try:
-                add_points_for_student(page, name, points)
-                results.append(f"{name}: {points} points saved")
-            except Exception as e:
-                results.append(f"{name}: POINTS FAILED - {e}")
+        # --- Phase 2: points only when the payload includes them ---
+        if sync_points:
+            for student in students:
+                if "points" not in student:
+                    continue
+                name = student["name"]
+                points = student["points"]
+                try:
+                    add_points_for_student(page, name, points)
+                    results.append(f"{name}: {points} points saved")
+                except Exception as e:
+                    results.append(f"{name}: POINTS FAILED - {e}")
 
         browser.close()
 
@@ -661,634 +676,4 @@ def debug_rewards_page(student_name=None):
     return {
         "rewards_list_html": rewards_list_html,
         "student_page_html": student_page_html,
-    }
-
-
-def _dump_all_frames(page):
-    """
-    Shared helper: returns [{name, url, html}] for every frame currently
-    on the page (the main page counts as one frame with name ""). Used
-    by both Marks debug functions so we never miss content that turns
-    out to live in a nested iframe, the way Attendance's did.
-    """
-    frames_dump = []
-    for frame in page.frames:
-        entry = {"name": frame.name, "url": frame.url}
-        try:
-            entry["html"] = frame.content()
-        except Exception as e:
-            entry["error"] = str(e)
-        frames_dump.append(entry)
-    return frames_dump
-
-
-def debug_marks_page(click_texts=None, screenshot=False):
-    """
-    Diagnostic ONLY -- this is the discovery step for School Marks/quiz
-    marks, the same way debug_attendance_page/debug_rewards_page were
-    used to nail down the real selectors for Attendance and Rewards.
-    NOTHING about the marks flow below has been confirmed against the
-    live site yet.
-
-    Logs in, goes to MARKS_URL (currently just a guess -- see the note
-    above it), then optionally clicks through a sequence of link/button
-    texts one at a time (e.g. click_texts=["Create New Mark"]) to reach
-    a deeper screen. After that, it dumps:
-      - every frame's name, URL, and full HTML (the main page counts as
-        one "frame" with name None) -- Attendance turned out to live in
-        a nested iframe named "attend", so this grabs everything rather
-        than assuming Marks does or doesn't work the same way
-      - optionally a full-page screenshot (base64-encoded PNG), which
-        can be quicker to eyeball than raw HTML for figuring out what
-        screen we actually landed on
-
-    Safety: this never clicks anything resembling a save/submit control
-    on its own -- only whatever exact text you pass in click_texts, and
-    if any click in the sequence fails to find a match, it stops there
-    (recorded in click_results) rather than guessing at what comes next.
-    Landing on a blank "create new mark" form is expected to be safe
-    (nothing persists until an actual Save is clicked), but reaching the
-    per-student marks table appears -- going by the old browser-extension
-    code -- to require submitting that header form first, which IS a
-    real save on Nigri's side. That's deliberately a separate, later,
-    opt-in step (do it once with an obviously-fake test title/date so
-    it's easy to find and delete) -- see debug_marks_create_and_view().
-    """
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
-
-        login(page)
-        page.goto(MARKS_URL)
-        page.wait_for_load_state("networkidle")
-
-        click_results = []
-        for text in (click_texts or []):
-            try:
-                page.click(f"text={text}", timeout=5000)
-                page.wait_for_load_state("networkidle")
-                page.wait_for_timeout(500)
-                click_results.append({"text": text, "ok": True})
-            except Exception as e:
-                click_results.append({"text": text, "ok": False, "error": str(e)})
-                break  # later clicks are probably meaningless if this one failed
-
-        main_url = page.url
-        frames_dump = _dump_all_frames(page)
-
-        screenshot_b64 = None
-        if screenshot:
-            screenshot_b64 = base64.b64encode(page.screenshot(full_page=True)).decode("ascii")
-
-        browser.close()
-
-    return {
-        "marks_url_used": MARKS_URL,
-        "landed_on_url": main_url,
-        "click_results": click_results,
-        "frames": frames_dump,
-        "screenshot_b64": screenshot_b64,
-    }
-
-
-# Real grade IDs confirmed via debug_marks_page HTML dump (2026-09-08).
-# select_option can also match by visible label text directly, so these
-# aren't strictly required, but kept here since we now know them for
-# certain and they may be useful later (e.g. for direct-URL navigation).
-MARKS_GRADE_IDS = {
-    "B3 ET": "22590",
-    "B3 WT": "22453",
-}
-
-
-# Real topic IDs confirmed via debug_marks_page's HTML dump (2026-09-08)
-# -- this is the FULL master list of topic options as shown BEFORE a
-# grade is picked. Selecting a topic by its value (id) instead of its
-# visible label sidesteps the AJAX-refresh timing problem found while
-# testing (see select_topic_robust below): the ids stay the same after
-# the grade-triggered refresh even though the select's DOM node itself
-# gets rebuilt.
-MARKS_TOPIC_IDS = {
-    "A Chossid is a Lamdan": "184",
-    "Behavior": "134",
-    "Biurei Tefila": "42",
-    "Chumash": "10",
-    "Chumash Comprehension": "137",
-    "Chumash Havana": "194",
-    "Chumash Translation": "138",
-    "Chumash-HW": "163",
-    "Chumash-Rashi": "139",
-    "Class Participation": "135",
-    "Devar Torah": "11",
-    "Halacha-Yahadus": "145",
-    "Inyonei Geulo UMoshiach": "27",
-    "Kriah": "58",
-    "Niggun": "7",
-    "Parsha": "9",
-    "Programs": "167",
-    "Shoroshim": "142",
-    "Tefila": "40",
-    "Worksheets": "189",
-}
-
-
-def select_topic_robust(page, class_section, topic_label, timeout_ms=15000, poll_ms=500):
-    """
-    Picking a grade (select#testGradeID) kicks off an AJAX call that
-    repopulates select#testTopicID -- confirmed (2026-09-08, testing
-    B3 ET) to be slow/unpredictable enough that selecting a topic right
-    after picking a grade can time out entirely. Instead of one blind
-    select_option call, this polls the LIVE option list on the select
-    element until the topic we want actually shows up, then selects it
-    -- by option value when we know the topic's id (MARKS_TOPIC_IDS;
-    more reliable than label text, which is what timed out before), or
-    by label as a fallback for a topic that isn't in that map.
-    """
-    topic_id = MARKS_TOPIC_IDS.get(topic_label)
-    waited = 0
-    while waited < timeout_ms:
-        try:
-            if topic_id is not None:
-                values = page.eval_on_selector(
-                    "select#testTopicID",
-                    "el => Array.from(el.options).map(o => o.value)",
-                )
-                if topic_id in values:
-                    page.select_option("select#testTopicID", value=topic_id)
-                    return
-            else:
-                labels = page.eval_on_selector(
-                    "select#testTopicID",
-                    "el => Array.from(el.options).map(o => o.textContent.trim())",
-                )
-                if topic_label in labels:
-                    page.select_option("select#testTopicID", label=topic_label)
-                    return
-        except Exception:
-            pass  # the select may be mid-reload right now -- just keep polling
-        page.wait_for_timeout(poll_ms)
-        waited += poll_ms
-
-    # Ran out of time -- report exactly what options WERE available, so a
-    # wrong/misspelled/unavailable-for-this-grade topic is obvious
-    # instead of just a bare timeout.
-    try:
-        available = page.eval_on_selector(
-            "select#testTopicID",
-            "el => Array.from(el.options).map(o => o.textContent.trim())",
-        )
-    except Exception:
-        available = None
-    raise RuntimeError(
-        f"Topic '{topic_label}' never appeared in the topic dropdown for "
-        f"class '{class_section}' after {timeout_ms}ms. Options actually "
-        f"available: {available!r}"
-    )
-
-
-def fill_student_mark(page, name, mark=None, attendance="present", comment=None, report_base64=None, report_filename=None):
-    """
-    Fills in one student's row on the per-student marks screen (the
-    screen that only exists after "Create Mark!" has been submitted --
-    see run_marks_sync). Confirmed real field names via
-    debug_marks_create_and_view's HTML dump (2026-09-08):
-        testChild_{childID}_mark              (text input, the score)
-        testChild_{childID}_markSpecialStatus  (select: ''=Present,
-            '1'=Absent, '2'=N/A, '3'=Excused)
-        testChild_{childID}_markComment        (textarea)
-        testChild_{childID}_File1              (file upload, one of
-            File1/File2/File3 -- only File1 is used here)
-
-    attendance is one of "present", "absent", or "review":
-      - "present" (default): leaves markSpecialStatus at its default
-        (blank = Present) and fills in the mark, if one was given.
-      - "absent": sets markSpecialStatus to Absent and does NOT fill in
-        a mark (an absent student doesn't have a quiz score).
-      - "review": leaves the status field untouched (blank/default),
-        same as "present", so nothing is guessed about Present vs
-        Absent for this student. Unlike before, "review" no longer
-        skips the whole row -- the mark and comment are independent of
-        attendance status, and a student with no completed attempt
-        still needs his 0 mark and his quiz-link comment filled in even
-        while his attendance is left unresolved.
-
-    report_base64, if given, is a base64-encoded PDF (the per-student
-    question-by-question report generated client-side in
-    B3SchoolMarksBridge.html) attached directly into the real File1
-    upload field -- no temp file needed, Playwright can attach an
-    in-memory buffer straight to a file input.
-    """
-    if name not in REWARDS_CHILD_IDS:
-        raise RuntimeError(f"No known childID for student: {name}")
-    cid = REWARDS_CHILD_IDS[name]
-
-    if attendance not in ("present", "absent", "review"):
-        raise ValueError(f"Unknown attendance value for {name}: {attendance!r}")
-
-    if attendance == "absent":
-        page.locator(f'select[name="testChild_{cid}_markSpecialStatus"]').select_option("1")
-    elif mark not in (None, ""):
-        # "present" or "review" -- review only leaves the status select
-        # untouched, it no longer bails out of filling the mark/comment.
-        mark_input = page.locator(f'input[name="testChild_{cid}_mark"]')
-        mark_input.fill(str(mark))
-        # The real field has an onchange handler (test_markFix) Nigri
-        # uses to validate/reformat what was typed -- fire a real
-        # change event so that runs, same as a person tabbing out of
-        # the box would trigger.
-        mark_input.evaluate(
-            """(el) => {
-                el.dispatchEvent(new Event('change', { bubbles: true }));
-                el.blur();
-            }"""
-        )
-
-    # Filled regardless of attendance status -- a missing student's
-    # quiz-link comment must go through even while his attendance is
-    # left on "review", and an absent student may still want the note.
-    if comment:
-        page.locator(f'textarea[name="testChild_{cid}_markComment"]').fill(str(comment))
-
-    if report_base64:
-        page.locator(f'input[name="testChild_{cid}_File1"]').set_input_files({
-            "name": report_filename or f"{name} - report.pdf",
-            "mimeType": "application/pdf",
-            "buffer": base64.b64decode(report_base64),
-        })
-
-
-def run_marks_sync(
-    class_section,
-    topic,
-    test_name,
-    students,
-    mark_type="quiz",
-    test_date=None,
-    description=None,
-    mark_all_done=True,
-):
-    """
-    The real, production version of the School Marks push -- the quiz
-    equivalent of run_sync() for attendance/points. One browser session:
-      1. Create a new mark (header form): grade, topic, type, name, and
-         optionally a date/description.
-      2. Fill in each student's score/status/comment on the resulting
-         per-student screen (see fill_student_mark).
-      3. Mark the whole thing "Marking done" (unless mark_all_done is
-         False) and submit the real final Save!.
-
-    Unlike the debug create-and-delete function, this does NOT delete
-    the mark afterward -- this is the real thing being pushed to the
-    gradebook, meant to stay there.
-
-    class_section: "B3 ET" or "B3 WT".
-    topic: a real topic label -- see MARKS_TOPIC_IDS for the confirmed
-      list (e.g. "Chumash", "Parsha", "Shoroshim", ...).
-    test_name: the mark's title, shown in Nigri's mark list.
-    students: [{"name": ..., "mark": ..., "attendance": "present" |
-      "absent" | "review", "comment": (optional)}, ...] -- "name" must
-      be a key in REWARDS_CHILD_IDS.
-    mark_type: one of "homework", "test", "quiz", "classwork".
-    """
-    if class_section not in MARKS_GRADE_IDS:
-        raise ValueError(f"Unknown class_section: {class_section}")
-    if mark_type not in ("homework", "test", "quiz", "classwork"):
-        raise ValueError(f"Unknown mark_type: {mark_type}")
-
-    results = []
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
-
-        login(page)
-        page.goto(MARKS_URL)
-        page.wait_for_load_state("networkidle")
-
-        try:
-            page.click("text=Create New Mark", timeout=5000)
-            page.wait_for_load_state("networkidle")
-        except Exception as e:
-            raise SyncError(f"Could not open 'Create New Mark': {e}", partial_results=results) from e
-
-        try:
-            page.select_option("select#testGradeID", label=class_section)
-            page.wait_for_load_state("networkidle")
-            page.wait_for_timeout(1000)  # let the topic-list AJAX refresh land
-        except Exception as e:
-            raise SyncError(f"Could not select grade '{class_section}': {e}", partial_results=results) from e
-
-        try:
-            select_topic_robust(page, class_section, topic)
-        except Exception as e:
-            raise SyncError(f"Could not select topic '{topic}': {e}", partial_results=results) from e
-
-        try:
-            page.check(f"input#testType_{mark_type}")
-        except Exception as e:
-            raise SyncError(f"Could not select mark type '{mark_type}': {e}", partial_results=results) from e
-
-        try:
-            page.fill('input[name="testName"]', test_name)
-        except Exception as e:
-            raise SyncError(f"Could not fill in the mark name: {e}", partial_results=results) from e
-
-        if test_date:
-            try:
-                page.fill('input[name="testDate"]', test_date)
-            except Exception as e:
-                raise SyncError(f"Could not fill in the date: {e}", partial_results=results) from e
-
-        if description:
-            try:
-                page.fill('textarea[name="testDesc"]', description)
-            except Exception as e:
-                raise SyncError(f"Could not fill in the description: {e}", partial_results=results) from e
-
-        try:
-            page.click('input[type="submit"][value="Create Mark!"]')
-            page.wait_for_load_state("networkidle")
-            page.wait_for_timeout(500)
-        except Exception as e:
-            raise SyncError(f"Could not submit 'Create Mark!': {e}", partial_results=results) from e
-
-        landed_on_url = page.url
-        match = re.search(r"testID=(\d+)", landed_on_url)
-        test_id = match.group(1) if match else None
-        if not test_id or test_id == "0":
-            raise SyncError(
-                f"Mark was submitted but no real testID came back in the URL "
-                f"({landed_on_url}) -- stopping before touching any student rows.",
-                partial_results=results,
-            )
-        results.append(f"Mark created (testID={test_id})")
-
-        for student in students:
-            name = student["name"]
-            attendance = student.get("attendance", "present")
-            try:
-                fill_student_mark(
-                    page,
-                    name=name,
-                    mark=student.get("mark"),
-                    attendance=attendance,
-                    comment=student.get("comment"),
-                    report_base64=student.get("report_base64"),
-                    report_filename=student.get("report_filename"),
-                )
-                results.append(f"{name}: filled (attendance={attendance})")
-            except Exception as e:
-                results.append(f"{name}: FAILED - {e}")
-
-        if mark_all_done:
-            try:
-                # Confirmed via debug_marks_create_and_view's HTML dump
-                # (2026-09-08) that this field has no id -- it must be
-                # targeted by its name attribute, not select#testCompleted.
-                page.select_option('select[name="testCompleted"]', value="1")
-            except Exception as e:
-                results.append(f"Could not set 'Marking done': {e}")
-
-        try:
-            page.click('input[type="submit"][value="Save!"]')
-            page.wait_for_load_state("networkidle")
-            page.wait_for_timeout(500)
-            results.append("Final Save! submitted")
-        except Exception as e:
-            raise SyncError(
-                f"Mark {test_id} was created and student rows were filled, but "
-                f"the final Save! failed: {e}",
-                partial_results=results,
-            ) from e
-
-        browser.close()
-
-    return {"test_id": test_id, "results": results}
-
-
-# A tiny, valid, hand-built one-page PDF ("TEST REPORT ATTACHMENT") used
-# ONLY by debug_marks_full_flow's with_report option, to safely confirm
-# Playwright's set_input_files() (used by fill_student_mark for the real
-# per-student report upload) actually works against Nigri's real File1
-# field before trusting it with real quiz reports.
-_TEST_REPORT_PDF_BASE64 = (
-    "JVBERi0xLjQKMSAwIG9iajw8L1R5cGUvQ2F0YWxvZy9QYWdlcyAyIDAgUj4+ZW5kb2JqCjIgMCBv"
-    "Ymo8PC9UeXBlL1BhZ2VzL0tpZHNbMyAwIFJdL0NvdW50IDE+PmVuZG9iagozIDAgb2JqPDwvVHlw"
-    "ZS9QYWdlL1BhcmVudCAyIDAgUi9NZWRpYUJveFswIDAgMjAwIDEwMF0vUmVzb3VyY2VzPDwvRm9u"
-    "dDw8L0YxIDQgMCBSPj4+Pi9Db250ZW50cyA1IDAgUj4+ZW5kb2JqCjQgMCBvYmo8PC9UeXBlL0Zv"
-    "bnQvU3VidHlwZS9UeXBlMS9CYXNlRm9udC9IZWx2ZXRpY2E+PmVuZG9iago1IDAgb2JqPDwvTGVu"
-    "Z3RoIDYyPj5zdHJlYW0KQlQgL0YxIDEyIFRmIDIwIDYwIFRkIChURVNUIFJFUE9SVCBBVFRBQ0hN"
-    "RU5UKSBUaiBFVAplbmRzdHJlYW0KZW5kb2JqCnhyZWYKMCA2CjAwMDAwMDAwMDAgNjU1MzUgZiAK"
-    "dHJhaWxlcjw8L1NpemUgNi9Sb290IDEgMCBSPj4Kc3RhcnR4cmVmCjAKJSVFT0Y="
-)
-
-
-def debug_marks_full_flow(
-    class_section,
-    topic,
-    test_name="ZZZ_DEBUG_DELETE_ME",
-    mark_type="quiz",
-    test_date=None,
-    students=None,
-    delete_after=True,
-    with_report=False,
-):
-    """
-    Runs the REAL production run_marks_sync() end-to-end (create mark,
-    fill student row(s), click the real final Save!) against an
-    obviously-fake test_name -- then, if delete_after is true (the
-    default), deletes that test mark afterward the same way
-    debug_marks_create_and_view does. This is the safe way to test the
-    WHOLE real flow (topic-selection fix included) with a real-shaped
-    student before wiring this up to a real quiz's data.
-
-    Defaults to one harmless test student if none is given. If
-    with_report is true and no students were given, attaches the tiny
-    test PDF above to that default student, to confirm the file-upload
-    step itself works before trusting it with a real generated report.
-    """
-    if not students:
-        students = [{"name": "Chaikin Mayer Chaim", "mark": "9", "attendance": "present", "comment": "test"}]
-        if with_report:
-            students[0]["report_base64"] = _TEST_REPORT_PDF_BASE64
-            students[0]["report_filename"] = "test-report-attachment.pdf"
-
-    sync_result = run_marks_sync(
-        class_section=class_section,
-        topic=topic,
-        test_name=test_name,
-        students=students,
-        mark_type=mark_type,
-        test_date=test_date,
-    )
-
-    test_id = sync_result.get("test_id")
-    delete_result = None
-    if delete_after and test_id:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page()
-            login(page)
-            del_url = (
-                f"{NIGRI_BASE_URL}/main/default_os_prog.asp"
-                f"?section=teachers&spec=tests&action=del_test&testID={test_id}"
-            )
-            page.goto(del_url)
-            page.wait_for_load_state("networkidle")
-            delete_result = {"ok": True, "test_id": test_id, "final_url": page.url}
-            browser.close()
-
-    return {**sync_result, "delete_result": delete_result}
-
-
-def debug_marks_create_and_view(
-    class_section,
-    topic_label,
-    mark_type="quiz",
-    test_name="ZZZ_DEBUG_DELETE_ME",
-    test_date=None,
-    delete_after=True,
-    screenshot=False,
-):
-    """
-    Diagnostic step 2 for School Marks. UNLIKE debug_marks_page, this one
-    DOES write to the real Nigri site: it fills in the real header form
-    (confirmed via debug_marks_page -- select#testGradeID, #testTopicID,
-    input#testType_{homework|test|quiz|classwork}, input[name=testDate],
-    input[name=testName], textarea[name=testDesc]) with obviously-fake
-    test values, clicks "Create Mark!", and captures whatever the
-    resulting per-student marks screen looks like -- that screen's real
-    field names are the one thing debug_marks_page couldn't reach, since
-    getting there requires an actual save.
-
-    class_section must be "B3 ET" or "B3 WT" (the real dropdown text).
-    topic_label must match one of the real topic option texts (e.g.
-    "Chumash", "Shoroshim", "Parsha", "Chumash Comprehension", ...) --
-    see debug_marks_page's dumped HTML for the full confirmed list.
-    mark_type must be one of "homework", "test", "quiz", "classwork".
-
-    Safety: if delete_after is true (the default), this finds the new
-    testID from the post-save URL and immediately deletes that same test
-    mark by hitting the same URL Nigri's own "delete test" link uses
-    (tests_delTest() in their JS: ...&action=del_test&testID=...), so the
-    obviously-fake entry doesn't linger in the real gradebook. Every step
-    is recorded in "steps" regardless of whether it succeeded, so a
-    failure partway through still tells us exactly how far it got.
-    """
-    steps = []
-
-    def record(name, ok, detail=None):
-        entry = {"step": name, "ok": ok}
-        if detail is not None:
-            entry["detail"] = detail
-        steps.append(entry)
-
-    landed_on_url = None
-    test_id = None
-    frames_dump = []
-    screenshot_b64 = None
-    delete_result = None
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
-
-        login(page)
-        page.goto(MARKS_URL)
-        page.wait_for_load_state("networkidle")
-
-        try:
-            page.click("text=Create New Mark", timeout=5000)
-            page.wait_for_load_state("networkidle")
-            record("click_create_new_mark", True)
-        except Exception as e:
-            record("click_create_new_mark", False, str(e))
-            frames_dump = _dump_all_frames(page)
-            browser.close()
-            return {"steps": steps, "aborted": True, "frames": frames_dump}
-
-        try:
-            page.select_option("select#testGradeID", label=class_section)
-            page.wait_for_load_state("networkidle")
-            # Selecting the grade triggers an AJAX call that repopulates
-            # the topic dropdown -- give it a beat to land before we try
-            # to select a topic from it.
-            page.wait_for_timeout(1000)
-            record("select_grade", True, class_section)
-        except Exception as e:
-            record("select_grade", False, str(e))
-
-        try:
-            page.select_option("select#testTopicID", label=topic_label)
-            record("select_topic", True, topic_label)
-        except Exception as e:
-            record("select_topic", False, str(e))
-
-        try:
-            page.check(f"input#testType_{mark_type}")
-            record("select_type", True, mark_type)
-        except Exception as e:
-            record("select_type", False, str(e))
-
-        try:
-            page.fill('input[name="testName"]', test_name)
-            record("fill_name", True, test_name)
-        except Exception as e:
-            record("fill_name", False, str(e))
-
-        if test_date:
-            try:
-                page.fill('input[name="testDate"]', test_date)
-                record("fill_date", True, test_date)
-            except Exception as e:
-                record("fill_date", False, str(e))
-
-        try:
-            page.click('input[type="submit"][value="Create Mark!"]')
-            page.wait_for_load_state("networkidle")
-            page.wait_for_timeout(500)
-            record("submit_create", True)
-        except Exception as e:
-            record("submit_create", False, str(e))
-            frames_dump = _dump_all_frames(page)
-            browser.close()
-            return {"steps": steps, "aborted": True, "frames": frames_dump}
-
-        landed_on_url = page.url
-        match = re.search(r"testID=(\d+)", landed_on_url)
-        test_id = match.group(1) if match else None
-        record("extract_test_id", bool(test_id) and test_id != "0", test_id)
-
-        frames_dump = _dump_all_frames(page)
-
-        if screenshot:
-            screenshot_b64 = base64.b64encode(page.screenshot(full_page=True)).decode("ascii")
-
-        if delete_after:
-            if test_id and test_id != "0":
-                try:
-                    del_url = (
-                        f"{NIGRI_BASE_URL}/main/default_os_prog.asp"
-                        f"?section=teachers&spec=tests&action=del_test&testID={test_id}"
-                    )
-                    page.goto(del_url)
-                    page.wait_for_load_state("networkidle")
-                    delete_result = {"ok": True, "test_id": test_id, "final_url": page.url}
-                    record("delete_test", True, test_id)
-                except Exception as e:
-                    delete_result = {"ok": False, "test_id": test_id, "error": str(e)}
-                    record("delete_test", False, str(e))
-            else:
-                delete_result = {"ok": False, "reason": "no test_id found in URL -- nothing deleted"}
-                record("delete_test", False, "no test_id found")
-
-        browser.close()
-
-    return {
-        "steps": steps,
-        "landed_on_url": landed_on_url,
-        "test_id": test_id,
-        "frames": frames_dump,
-        "screenshot_b64": screenshot_b64,
-        "delete_result": delete_result,
     }
