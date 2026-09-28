@@ -1,17 +1,16 @@
 """
-Read-only Nigri Attendance History reader, v5.
+Read-only Nigri Attendance History reader, v6.
 
-Fix for Last-60-days:
-Nigri's JavaScript was keeping stale customStartDate/customEndDate values in
-the generated URL. v5 navigates the already-authenticated history iframe
-directly with daysBack=59 and REMOVES those stale custom-date parameters.
+Fix:
+- Uses Nigri's own History controls/Go action (which correctly loads the table).
+- Clears stale customStartDate/customEndDate values BEFORE switching to
+  "Last 60 days", so Nigri cannot carry the previous custom range forward.
 
-Safety: read-only. This only changes the Attendance History display URL.
+Safety: read-only. This only changes the Attendance History display filter.
 It never touches attendance-entry controls or Save buttons.
 """
 
 import re
-from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 from playwright.sync_api import sync_playwright
 from nigri_playwright import NIGRI_BASE_URL, REWARDS_CHILD_IDS, login
 
@@ -33,26 +32,67 @@ def _find_history_frame(page):
     raise RuntimeError("Could not locate Nigri Attendance History frame.")
 
 
-def _build_60_day_url(frame_url):
-    parts = urlsplit(frame_url)
-    params = dict(parse_qsl(parts.query, keep_blank_values=True))
+def _apply_60_day_filter(page):
+    frame = _find_history_frame(page)
 
-    params["logs"] = "list"
-    params["xmlFile"] = "os"
-    params["daysBack"] = DAYS_BACK_VALUE
+    # Clear every known/custom-date field that Nigri's logChange() may read.
+    # Some may not exist; querySelector guards make this harmless.
+    frame.evaluate(
+        """() => {
+            const ids = [
+                'customStartDate', 'customEndDate',
+                'logCustomStartDate', 'logCustomEndDate'
+            ];
+            for (const id of ids) {
+                const el = document.getElementById(id);
+                if (el) el.value = '';
+            }
 
-    # These stale values caused Nigri to keep the old 7-day custom range
-    # even after daysBack was changed to 59.
-    params.pop("customStartDate", None)
-    params.pop("customEndDate", None)
+            const names = [
+                'customStartDate', 'customEndDate',
+                'logCustomStartDate', 'logCustomEndDate'
+            ];
+            for (const name of names) {
+                document.querySelectorAll(`[name="${name}"]`).forEach(el => {
+                    el.value = '';
+                });
+            }
+        }"""
+    )
 
-    return urlunsplit((
-        parts.scheme,
-        parts.netloc,
-        parts.path,
-        urlencode(params),
-        parts.fragment,
-    ))
+    frame.locator("select#daysBack").select_option(DAYS_BACK_VALUE)
+    page.wait_for_timeout(200)
+
+    # Use Nigri's own function if available; otherwise press the Go button.
+    used_log_change = frame.evaluate(
+        """() => {
+            if (typeof logChange === 'function') {
+                logChange();
+                return true;
+            }
+            return false;
+        }"""
+    )
+
+    if not used_log_change:
+        go = frame.locator('input[type="button"][value*="Go"]')
+        if not go.count():
+            raise RuntimeError("Could not find Nigri Attendance History Go button.")
+        go.first.click()
+
+    # The inner history frame navigates/reloads.
+    page.wait_for_timeout(1800)
+    frame = _find_history_frame(page)
+
+    # Wait for actual data rows rather than trusting networkidle on this old page.
+    try:
+        frame.locator("table.logsTbl tbody tr[childid]").first.wait_for(
+            state="attached", timeout=7000
+        )
+    except Exception:
+        pass
+
+    return frame
 
 
 def _cell_payload(cell):
@@ -67,13 +107,7 @@ def _cell_payload(cell):
                     className: el.className || '',
                     backgroundImage: cs.backgroundImage || '',
                     backgroundColor: cs.backgroundColor || '',
-                    color: cs.color || '',
-                    images: Array.from(el.querySelectorAll('img')).map(img => ({
-                        src: img.getAttribute('src') || '',
-                        alt: img.getAttribute('alt') || '',
-                        title: img.getAttribute('title') || '',
-                        className: img.className || ''
-                    }))
+                    color: cs.color || ''
                 };
             }"""
         )
@@ -86,7 +120,6 @@ def _cell_payload(cell):
             "backgroundImage": "",
             "backgroundColor": "",
             "color": "",
-            "images": [],
         }
 
 
@@ -126,17 +159,7 @@ def read_attendance():
         page.wait_for_load_state("networkidle")
         page.wait_for_timeout(1000)
 
-        frame = _find_history_frame(page)
-
-        # Navigate the authenticated inner history frame directly to a clean
-        # 60-day URL so stale custom dates cannot override daysBack=59.
-        clean_url = _build_60_day_url(frame.url)
-        frame.goto(clean_url)
-        frame.wait_for_load_state("networkidle")
-        page.wait_for_timeout(1000)
-
-        # Reacquire in case Nigri replaced the iframe document.
-        frame = _find_history_frame(page)
+        frame = _apply_60_day_filter(page)
 
         dates = _read_dates(frame)
         rows = frame.locator("table.logsTbl tbody tr[childid]")
