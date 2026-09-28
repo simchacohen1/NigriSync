@@ -1,16 +1,21 @@
 """
-Read-only Nigri Attendance History reader, v6.
+Read-only Nigri Attendance History reader, robust weekly-window version.
 
-Fix:
-- Uses Nigri's own History controls/Go action (which correctly loads the table).
-- Clears stale customStartDate/customEndDate values BEFORE switching to
-  "Last 60 days", so Nigri cannot carry the previous custom range forward.
+Why this approach:
+Nigri reliably returns populated attendance rows for its 7-day history view,
+but the 60-day view can return only the range header with no student table.
+Instead of relying on that flaky long-range rendering, this reader requests
+the history in consecutive 7-day windows and combines the results.
 
-Safety: read-only. This only changes the Attendance History display filter.
-It never touches attendance-entry controls or Save buttons.
+Safety:
+- Read-only.
+- Uses only the Attendance History display URL.
+- Never touches attendance-entry checkboxes, Save buttons, or forms.
 """
 
 import re
+import datetime
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 from playwright.sync_api import sync_playwright
 from nigri_playwright import NIGRI_BASE_URL, REWARDS_CHILD_IDS, login
 
@@ -19,7 +24,9 @@ ATTENDANCE_HISTORY_URL = (
     "?section=teachers&spec=logs&xmlFile=os"
 )
 
-DAYS_BACK_VALUE = "59"
+# Current school year started in late August 2026.
+# Pull from Aug 25 through today in reliable 7-day windows.
+SCHOOL_YEAR_START = datetime.date(2026, 8, 25)
 
 
 def _find_history_frame(page):
@@ -32,67 +39,32 @@ def _find_history_frame(page):
     raise RuntimeError("Could not locate Nigri Attendance History frame.")
 
 
-def _apply_60_day_filter(page):
-    frame = _find_history_frame(page)
+def _build_window_url(frame_url, start_date, end_date):
+    """
+    Preserve Nigri's working history URL parameters, but force a 7-day-style
+    custom window. This mirrors the shape of the URL that already returned
+    populated student data successfully.
+    """
+    parts = urlsplit(frame_url)
+    params = dict(parse_qsl(parts.query, keep_blank_values=True))
 
-    # Clear every known/custom-date field that Nigri's logChange() may read.
-    # Some may not exist; querySelector guards make this harmless.
-    frame.evaluate(
-        """() => {
-            const ids = [
-                'customStartDate', 'customEndDate',
-                'logCustomStartDate', 'logCustomEndDate'
-            ];
-            for (const id of ids) {
-                const el = document.getElementById(id);
-                if (el) el.value = '';
-            }
+    params["logs"] = "list"
+    params["xmlFile"] = "os"
+    params["daysBack"] = "6"
+    params["customStartDate"] = f"{start_date.month}/{start_date.day}/{start_date.year}"
+    params["customEndDate"] = f"{end_date.month}/{end_date.day}/{end_date.year}"
 
-            const names = [
-                'customStartDate', 'customEndDate',
-                'logCustomStartDate', 'logCustomEndDate'
-            ];
-            for (const name of names) {
-                document.querySelectorAll(`[name="${name}"]`).forEach(el => {
-                    el.value = '';
-                });
-            }
-        }"""
-    )
+    return urlunsplit((
+        parts.scheme,
+        parts.netloc,
+        parts.path,
+        urlencode(params),
+        parts.fragment,
+    ))
 
-    frame.locator("select#daysBack").select_option(DAYS_BACK_VALUE)
-    page.wait_for_timeout(200)
 
-    # Use Nigri's own function if available; otherwise press the Go button.
-    used_log_change = frame.evaluate(
-        """() => {
-            if (typeof logChange === 'function') {
-                logChange();
-                return true;
-            }
-            return false;
-        }"""
-    )
-
-    if not used_log_change:
-        go = frame.locator('input[type="button"][value*="Go"]')
-        if not go.count():
-            raise RuntimeError("Could not find Nigri Attendance History Go button.")
-        go.first.click()
-
-    # The inner history frame navigates/reloads.
-    page.wait_for_timeout(1800)
-    frame = _find_history_frame(page)
-
-    # Wait for actual data rows rather than trusting networkidle on this old page.
-    try:
-        frame.locator("table.logsTbl tbody tr[childid]").first.wait_for(
-            state="attached", timeout=7000
-        )
-    except Exception:
-        pass
-
-    return frame
+def _fmt_date(d):
+    return f"{d.month}/{d.day}/{d.year}"
 
 
 def _cell_payload(cell):
@@ -123,19 +95,6 @@ def _cell_payload(cell):
         }
 
 
-def _read_dates(frame):
-    dates = []
-    headers = frame.locator("table.logsTbl thead td[currdate]")
-    for i in range(headers.count()):
-        try:
-            d = headers.nth(i).get_attribute("currdate")
-            if d:
-                dates.append(d)
-        except Exception:
-            pass
-    return dates
-
-
 def _normalized_status(cell):
     cls = (cell.get("className") or "").split()
     bg = (cell.get("backgroundImage") or "").lower()
@@ -149,6 +108,52 @@ def _normalized_status(cell):
     return "unknown"
 
 
+def _read_one_window(frame):
+    dates = []
+    headers = frame.locator("table.logsTbl thead td[currdate]")
+    for i in range(headers.count()):
+        try:
+            d = headers.nth(i).get_attribute("currdate")
+            if d:
+                dates.append(d)
+        except Exception:
+            pass
+
+    rows = frame.locator("table.logsTbl tbody tr[childid]")
+    id_to_name = {str(v): k for k, v in REWARDS_CHILD_IDS.items()}
+    students = {}
+
+    for i in range(rows.count()):
+        row = rows.nth(i)
+        child_id = (row.get_attribute("childid") or "").strip()
+        cells = row.locator(":scope > td")
+        if cells.count() < 2:
+            continue
+
+        try:
+            display_name = cells.nth(0).inner_text().strip()
+        except Exception:
+            display_name = ""
+
+        name = id_to_name.get(child_id) or display_name
+        days = []
+
+        for j in range(1, cells.count()):
+            payload = _cell_payload(cells.nth(j))
+            payload["date"] = dates[j - 1] if (j - 1) < len(dates) else None
+            payload["status"] = _normalized_status(payload)
+            days.append(payload)
+
+        students[child_id] = {
+            "name": name,
+            "display_name": display_name,
+            "child_id": child_id,
+            "days": days,
+        }
+
+    return dates, students
+
+
 def read_attendance():
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -159,57 +164,91 @@ def read_attendance():
         page.wait_for_load_state("networkidle")
         page.wait_for_timeout(1000)
 
-        frame = _apply_60_day_filter(page)
+        frame = _find_history_frame(page)
+        base_frame_url = frame.url
 
-        dates = _read_dates(frame)
-        rows = frame.locator("table.logsTbl tbody tr[childid]")
+        today = datetime.date.today()
+        start = SCHOOL_YEAR_START
+        if start > today:
+            start = today - datetime.timedelta(days=59)
 
-        id_to_name = {str(v): k for k, v in REWARDS_CHILD_IDS.items()}
-        students = []
+        # Build non-overlapping 7-day windows.
+        windows = []
+        cursor = start
+        while cursor <= today:
+            end = min(cursor + datetime.timedelta(days=6), today)
+            windows.append((cursor, end))
+            cursor = end + datetime.timedelta(days=1)
 
-        for i in range(rows.count()):
-            row = rows.nth(i)
-            child_id = (row.get_attribute("childid") or "").strip()
-            cells = row.locator(":scope > td")
-            if cells.count() < 2:
-                continue
+        all_dates = []
+        merged = {}
+        window_results = []
 
-            try:
-                display_name = cells.nth(0).inner_text().strip()
-            except Exception:
-                display_name = ""
+        for start_date, end_date in windows:
+            url = _build_window_url(base_frame_url, start_date, end_date)
 
-            name = id_to_name.get(child_id) or display_name
-            day_cells = []
+            frame.goto(url)
+            frame.wait_for_load_state("networkidle")
 
-            for j in range(1, cells.count()):
-                payload = _cell_payload(cells.nth(j))
-                payload["date"] = dates[j - 1] if (j - 1) < len(dates) else None
-                payload["status"] = _normalized_status(payload)
-                day_cells.append(payload)
+            # Old Nigri pages can populate slightly after navigation.
+            # Poll for either rows or a "Logs for..." range header.
+            for _ in range(20):
+                row_count = frame.locator("table.logsTbl tbody tr[childid]").count()
+                body_text = ""
+                try:
+                    body_text = frame.locator("body").inner_text(timeout=500)
+                except Exception:
+                    pass
+                if row_count or "Logs for" in body_text:
+                    # Give dynamic table population one extra moment.
+                    page.wait_for_timeout(350)
+                    break
+                page.wait_for_timeout(250)
 
-            students.append({
-                "name": name,
-                "display_name": display_name,
-                "child_id": child_id,
-                "days": day_cells,
+            dates, students = _read_one_window(frame)
+
+            window_results.append({
+                "start": _fmt_date(start_date),
+                "end": _fmt_date(end_date),
+                "date_count": len(dates),
+                "student_count": len(students),
+                "url": frame.url,
             })
 
-        frame_text = ""
-        try:
-            frame_text = frame.locator("body").inner_text()
-        except Exception:
-            pass
+            for d in dates:
+                if d not in all_dates:
+                    all_dates.append(d)
 
-        range_match = re.search(
-            r"Logs\s+for\s+(\d{1,2}/\d{1,2}/\d{4})"
-            r"\s*-\s*(\d{1,2}/\d{1,2}/\d{4})",
-            frame_text,
-            flags=re.I,
-        )
+            for child_id, student in students.items():
+                dest = merged.setdefault(child_id, {
+                    "name": student["name"],
+                    "display_name": student["display_name"],
+                    "child_id": child_id,
+                    "days": [],
+                })
+
+                existing_dates = {x.get("date") for x in dest["days"]}
+                for day in student["days"]:
+                    if day.get("date") and day.get("date") not in existing_dates:
+                        dest["days"].append(day)
+                        existing_dates.add(day.get("date"))
+
+        # Sort dates chronologically and each student's day records to match.
+        def parse_mdy(s):
+            try:
+                return datetime.datetime.strptime(s, "%m/%d/%Y").date()
+            except Exception:
+                return datetime.date.min
+
+        all_dates.sort(key=parse_mdy)
+
+        students_out = list(merged.values())
+        students_out.sort(key=lambda s: s["name"])
+        for student in students_out:
+            student["days"].sort(key=lambda d: parse_mdy(d.get("date") or ""))
 
         summaries = {}
-        for student in students:
+        for student in students_out:
             counts = {"present": 0, "absent": 0, "unknown": 0}
             for day in student["days"]:
                 status = day.get("status", "unknown")
@@ -218,16 +257,15 @@ def read_attendance():
 
         result = {
             "read_only": True,
-            "history_days_requested": 60,
-            "source_url": page.url,
-            "history_frame_name": frame.name,
-            "history_frame_url": frame.url,
-            "range_start": range_match.group(1) if range_match else None,
-            "range_end": range_match.group(2) if range_match else None,
-            "dates": dates,
-            "date_count": len(dates),
-            "student_count": len(students),
-            "students": students,
+            "strategy": "weekly_windows",
+            "school_year_start": _fmt_date(start),
+            "range_end": _fmt_date(today),
+            "window_count": len(windows),
+            "window_results": window_results,
+            "dates": all_dates,
+            "date_count": len(all_dates),
+            "student_count": len(students_out),
+            "students": students_out,
             "summaries": summaries,
         }
 
