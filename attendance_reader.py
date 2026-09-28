@@ -1,18 +1,17 @@
 """
-Read-only Nigri Attendance History reader.
+Read-only Nigri Attendance History reader, v3.
 
-This module is intentionally separate from nigri_playwright.py so the
-existing working attendance/points/marks automation does not need to be
-modified. It imports the already-confirmed login helper and student IDs.
+Changes from v2:
+- Reads only real student rows (tr[childid]) so nested parent tables do not
+  create duplicate student records.
+- Extracts the actual date headers.
+- Captures computed CSS/background information for each attendance cell so
+  Nigri's icon/status classes can be mapped accurately without guessing.
 """
 
 import re
 from playwright.sync_api import sync_playwright
-from nigri_playwright import (
-    NIGRI_BASE_URL,
-    REWARDS_CHILD_IDS,
-    login,
-)
+from nigri_playwright import NIGRI_BASE_URL, REWARDS_CHILD_IDS, login
 
 ATTENDANCE_HISTORY_URL = (
     f"{NIGRI_BASE_URL}/main/default_os_prog.asp"
@@ -20,83 +19,45 @@ ATTENDANCE_HISTORY_URL = (
 )
 
 
-def _best_history_table(page):
-    """
-    Find the Attendance History table across ALL frames.
-
-    Nigri uses nested frames in several teacher pages. The first version
-    searched only the top document, which can miss the history table even
-    when it is visibly on screen.
-    """
-    names = list(REWARDS_CHILD_IDS.keys())
-    best = None
-    best_frame = None
-    best_score = 0
-
+def _find_history_frame(page):
+    """Return the frame containing Nigri's real attendance history table."""
     for frame in page.frames:
         try:
-            tables = frame.locator("table")
-            count = tables.count()
+            if frame.locator("table.logsTbl tr[childid]").count() >= 3:
+                return frame
         except Exception:
-            continue
-
-        for i in range(count):
-            table = tables.nth(i)
-            try:
-                text = table.inner_text(timeout=1000)
-            except Exception:
-                continue
-
-            score = sum(1 for name in names if name in text)
-            if score > best_score:
-                best = table
-                best_frame = frame
-                best_score = score
-
-    if best is None or best_score < 3:
-        # Helpful diagnostics, still read-only.
-        frame_debug = []
-        for frame in page.frames:
-            try:
-                body_text = frame.locator("body").inner_text(timeout=1000)
-            except Exception:
-                body_text = ""
-            frame_debug.append({
-                "name": frame.name,
-                "url": frame.url,
-                "student_name_hits": [
-                    name for name in names if name in body_text
-                ],
-                "body_preview": body_text[:1200],
-            })
-
-        raise RuntimeError(
-            "Could not locate the Attendance History table containing B3 students. "
-            f"Frame diagnostics: {frame_debug}"
-        )
-
-    return best_frame, best, best_score
+            pass
+    raise RuntimeError("Could not locate Nigri Attendance History student rows.")
 
 
 def _cell_payload(cell):
-    """
-    Preserve text and icon metadata. Nigri uses icons for some attendance
-    statuses, so this first read intentionally does not guess what an icon means.
-    """
+    """Read one attendance cell without changing anything."""
     try:
         return cell.evaluate(
-            """el => ({
-                text: (el.innerText || el.textContent || '').trim(),
-                html: el.innerHTML || '',
-                title: el.getAttribute('title') || '',
-                className: el.className || '',
-                images: Array.from(el.querySelectorAll('img')).map(img => ({
-                    src: img.getAttribute('src') || '',
-                    alt: img.getAttribute('alt') || '',
-                    title: img.getAttribute('title') || '',
-                    className: img.className || ''
-                }))
-            })"""
+            """el => {
+                const cs = getComputedStyle(el);
+                const before = getComputedStyle(el, '::before');
+                const after = getComputedStyle(el, '::after');
+                return {
+                    text: (el.innerText || el.textContent || '').trim(),
+                    html: el.innerHTML || '',
+                    title: el.getAttribute('title') || '',
+                    className: el.className || '',
+                    backgroundImage: cs.backgroundImage || '',
+                    backgroundColor: cs.backgroundColor || '',
+                    color: cs.color || '',
+                    beforeContent: before.content || '',
+                    beforeBackgroundImage: before.backgroundImage || '',
+                    afterContent: after.content || '',
+                    afterBackgroundImage: after.backgroundImage || '',
+                    images: Array.from(el.querySelectorAll('img')).map(img => ({
+                        src: img.getAttribute('src') || '',
+                        alt: img.getAttribute('alt') || '',
+                        title: img.getAttribute('title') || '',
+                        className: img.className || ''
+                    }))
+                };
+            }"""
         )
     except Exception:
         return {
@@ -104,47 +65,44 @@ def _cell_payload(cell):
             "html": "",
             "title": "",
             "className": "",
+            "backgroundImage": "",
+            "backgroundColor": "",
+            "color": "",
+            "beforeContent": "",
+            "beforeBackgroundImage": "",
+            "afterContent": "",
+            "afterBackgroundImage": "",
             "images": [],
         }
 
 
-def _all_frame_text(page):
-    parts = []
-    for frame in page.frames:
+def _read_dates(frame):
+    """Read the actual visible date columns from currdate attributes."""
+    dates = []
+    headers = frame.locator("table.logsTbl thead td[currdate]")
+    for i in range(headers.count()):
+        h = headers.nth(i)
         try:
-            txt = frame.locator("body").inner_text(timeout=1000)
-            if txt:
-                parts.append(txt)
+            dates.append(h.get_attribute("currdate"))
         except Exception:
             pass
-    return "\n".join(parts)
+    return [d for d in dates if d]
 
 
-def _all_selects(page):
-    """
-    Capture select metadata across all frames so we can identify Nigri's
-    real grade/date-range controls without guessing.
-    """
+def _read_selects(frame):
     result = []
-
-    for frame in page.frames:
+    nodes = frame.locator("select")
+    for i in range(nodes.count()):
+        sel = nodes.nth(i)
         try:
-            nodes = frame.locator("select")
-            count = nodes.count()
-        except Exception:
-            continue
-
-        for i in range(count):
-            sel = nodes.nth(i)
-            try:
-                data = sel.evaluate(
+            result.append(
+                sel.evaluate(
                     """el => ({
                         id: el.id || '',
                         name: el.name || '',
                         value: el.value || '',
                         selectedText:
-                            el.selectedOptions &&
-                            el.selectedOptions.length
+                            el.selectedOptions && el.selectedOptions.length
                             ? el.selectedOptions[0].textContent.trim()
                             : '',
                         options: Array.from(el.options).map(o => ({
@@ -153,29 +111,18 @@ def _all_selects(page):
                         }))
                     })"""
                 )
-                data["frame_name"] = frame.name
-                data["frame_url"] = frame.url
-                result.append(data)
-            except Exception:
-                pass
-
+            )
+        except Exception:
+            pass
     return result
 
 
 def read_attendance():
     """
-    Read the currently displayed Nigri Attendance History page.
+    Read Nigri Attendance History.
 
-    SAFETY:
-      - Logs in.
-      - Opens Attendance History.
-      - Reads DOM/table values only.
-      - Does NOT click attendance checkboxes.
-      - Does NOT click Save.
-      - Does NOT submit an attendance form.
-
-    The returned raw cell/icon information lets us identify Nigri's real
-    Present/Absent/Late/Excused encoding before we normalize it.
+    SAFETY: read-only. No attendance checkbox, Save button, or form submission
+    is used anywhere in this function.
     """
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -186,77 +133,87 @@ def read_attendance():
         page.wait_for_load_state("networkidle")
         page.wait_for_timeout(1200)
 
-        history_frame, table, match_score = _best_history_table(page)
-        rows = table.locator("tr")
+        frame = _find_history_frame(page)
+        dates = _read_dates(frame)
 
-        raw_rows = []
+        rows = frame.locator("table.logsTbl tbody tr[childid]")
         students = []
-        known_names = set(REWARDS_CHILD_IDS.keys())
 
-        for row_index in range(rows.count()):
-            row = rows.nth(row_index)
-            cells = row.locator("th,td")
-            payloads = [
-                _cell_payload(cells.nth(i))
-                for i in range(cells.count())
+        id_to_name = {str(v): k for k, v in REWARDS_CHILD_IDS.items()}
+
+        for i in range(rows.count()):
+            row = rows.nth(i)
+            child_id = (row.get_attribute("childid") or "").strip()
+            cells = row.locator(":scope > td")
+            if cells.count() < 2:
+                continue
+
+            visible_name = ""
+            try:
+                visible_name = cells.nth(0).inner_text().strip()
+            except Exception:
+                pass
+
+            name = id_to_name.get(child_id) or visible_name
+            status_cells = [
+                _cell_payload(cells.nth(j))
+                for j in range(1, cells.count())
             ]
 
-            if not payloads:
-                continue
+            # Align cells to actual dates. If Nigri ever returns a mismatch,
+            # preserve all cells and expose the mismatch instead of guessing.
+            by_date = []
+            for j, cell in enumerate(status_cells):
+                by_date.append({
+                    "date": dates[j] if j < len(dates) else None,
+                    **cell,
+                })
 
-            raw_rows.append(payloads)
+            students.append({
+                "name": name,
+                "display_name": visible_name,
+                "child_id": child_id,
+                "days": by_date,
+            })
 
-            row_text = " ".join(
-                payload.get("text", "")
-                for payload in payloads
-            ).strip()
-
-            matched_name = next(
-                (name for name in known_names if name in row_text),
-                None,
-            )
-            if not matched_name:
-                continue
-
-            name_index = next(
-                (
-                    i
-                    for i, payload in enumerate(payloads)
-                    if matched_name in payload.get("text", "")
-                ),
-                0,
-            )
-
-            students.append(
-                {
-                    "name": matched_name,
-                    "child_id": REWARDS_CHILD_IDS.get(matched_name),
-                    "cells": payloads[name_index + 1 :],
-                    "raw_row": payloads,
-                }
-            )
-
-        body_text = _all_frame_text(page)
-
+        frame_text = frame.locator("body").inner_text()
         range_match = re.search(
             r"Logs\s+for\s+(\d{1,2}/\d{1,2}/\d{4})"
             r"\s*-\s*(\d{1,2}/\d{1,2}/\d{4})",
-            body_text,
+            frame_text,
             flags=re.I,
         )
+
+        # Compact status-style dictionary: one example for every distinct
+        # class/style combination found. This makes mapping easy.
+        style_examples = {}
+        for student in students:
+            for day in student["days"]:
+                key = day.get("className", "")
+                if key not in style_examples:
+                    style_examples[key] = {
+                        "className": key,
+                        "backgroundImage": day.get("backgroundImage"),
+                        "backgroundColor": day.get("backgroundColor"),
+                        "color": day.get("color"),
+                        "beforeContent": day.get("beforeContent"),
+                        "beforeBackgroundImage": day.get("beforeBackgroundImage"),
+                        "afterContent": day.get("afterContent"),
+                        "afterBackgroundImage": day.get("afterBackgroundImage"),
+                    }
 
         result = {
             "read_only": True,
             "source_url": page.url,
-            "history_frame_url": history_frame.url if history_frame else None,
-            "history_frame_name": history_frame.name if history_frame else None,
-            "student_name_match_score": match_score,
+            "history_frame_name": frame.name,
+            "history_frame_url": frame.url,
             "range_start": range_match.group(1) if range_match else None,
             "range_end": range_match.group(2) if range_match else None,
+            "dates": dates,
             "student_count": len(students),
             "students": students,
-            "raw_rows": raw_rows,
-            "selects": _all_selects(page),
+            "status_style_examples": style_examples,
+            "selects": _read_selects(frame),
         }
 
         browser.close()
