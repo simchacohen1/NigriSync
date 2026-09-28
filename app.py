@@ -26,6 +26,7 @@ from nigri_playwright import (
     debug_marks_full_flow,
     SyncError,
 )
+from attendance_reader import read_attendance
 
 app = Flask(__name__)
 CORS(app)  # allow calls from simchacohen1.github.io
@@ -274,7 +275,6 @@ def sync_marks():
         return jsonify({"status": "error", "detail": str(e)}), 500
 
 
-
 @app.route("/read-marks", methods=["GET", "POST"])
 def read_marks_endpoint():
     """
@@ -312,6 +312,24 @@ def read_marks_endpoint():
         return jsonify({"status": "success", **result})
     except Exception as e:
         return jsonify({"status": "error", "detail": str(e)}), 500
+
+
+@app.route("/read-attendance", methods=["GET", "POST"])
+def read_attendance_endpoint():
+    """
+    Authenticated READ-ONLY endpoint for Nigri Attendance History.
+    No attendance checkboxes or Save controls are touched.
+    """
+    provided_key = request.headers.get("X-Sync-Key") or request.args.get("key")
+    if not SYNC_API_KEY or provided_key != SYNC_API_KEY:
+        return jsonify({"error": "unauthorized"}), 401
+
+    try:
+        result = read_attendance()
+        return jsonify({"status": "success", **result})
+    except Exception as e:
+        return jsonify({"status": "error", "detail": str(e)}), 500
+
 
 @app.route("/debug-marks-full", methods=["GET", "POST"])
 def debug_marks_full():
