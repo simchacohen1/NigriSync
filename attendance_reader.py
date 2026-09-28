@@ -1,15 +1,17 @@
 """
-Read-only Nigri Attendance History reader, v4.
+Read-only Nigri Attendance History reader, v5.
 
-This version automatically switches Attendance History to "Last 60 days"
-before reading it. For the current school year (which began in late August),
-that covers the full year-to-date attendance history.
+Fix for Last-60-days:
+Nigri's JavaScript was keeping stale customStartDate/customEndDate values in
+the generated URL. v5 navigates the already-authenticated history iframe
+directly with daysBack=59 and REMOVES those stale custom-date parameters.
 
-Safety: read-only. It changes only the History page's display filter; it never
-touches attendance-entry checkboxes, Save buttons, or attendance forms.
+Safety: read-only. This only changes the Attendance History display URL.
+It never touches attendance-entry controls or Save buttons.
 """
 
 import re
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 from playwright.sync_api import sync_playwright
 from nigri_playwright import NIGRI_BASE_URL, REWARDS_CHILD_IDS, login
 
@@ -18,63 +20,42 @@ ATTENDANCE_HISTORY_URL = (
     "?section=teachers&spec=logs&xmlFile=os"
 )
 
-# Nigri's confirmed "Last 60 days" option value.
 DAYS_BACK_VALUE = "59"
 
 
 def _find_history_frame(page):
-    """Return the frame containing Nigri's real attendance-history controls/table."""
     for frame in page.frames:
         try:
-            if frame.locator("select#daysBack").count() and frame.locator("table.logsTbl").count():
+            if "teacherAdmin.asp" in frame.url and "logs=list" in frame.url:
                 return frame
         except Exception:
             pass
-
-    # On a very fast load, the table may not be populated yet. Accept the
-    # controls frame and let the caller wait/reload it.
-    for frame in page.frames:
-        try:
-            if frame.locator("select#daysBack").count():
-                return frame
-        except Exception:
-            pass
-
     raise RuntimeError("Could not locate Nigri Attendance History frame.")
 
 
-def _set_60_day_history(page):
-    """
-    Set the History display to Last 60 days and apply it.
+def _build_60_day_url(frame_url):
+    parts = urlsplit(frame_url)
+    params = dict(parse_qsl(parts.query, keep_blank_values=True))
 
-    This is a READ-ONLY display/filter action. It does not alter attendance.
-    """
-    frame = _find_history_frame(page)
+    params["logs"] = "list"
+    params["xmlFile"] = "os"
+    params["daysBack"] = DAYS_BACK_VALUE
 
-    current = None
-    try:
-        current = frame.locator("select#daysBack").input_value()
-    except Exception:
-        pass
+    # These stale values caused Nigri to keep the old 7-day custom range
+    # even after daysBack was changed to 59.
+    params.pop("customStartDate", None)
+    params.pop("customEndDate", None)
 
-    if current != DAYS_BACK_VALUE:
-        frame.locator("select#daysBack").select_option(DAYS_BACK_VALUE)
-        frame.page.wait_for_timeout(250)
-
-        # Nigri shows an explicit Go! button beside the date-range dropdown.
-        go = frame.locator('input[type="button"][value*="Go"]')
-        if go.count():
-            go.first.click()
-
-        # The inner frame can refresh/reload after applying the filter.
-        page.wait_for_timeout(1500)
-
-    # Always reacquire the live frame after the filter action.
-    return _find_history_frame(page)
+    return urlunsplit((
+        parts.scheme,
+        parts.netloc,
+        parts.path,
+        urlencode(params),
+        parts.fragment,
+    ))
 
 
 def _cell_payload(cell):
-    """Read one attendance-history cell without changing anything."""
     try:
         return cell.evaluate(
             """el => {
@@ -110,51 +91,32 @@ def _cell_payload(cell):
 
 
 def _read_dates(frame):
-    """Read the real date columns from Nigri's currdate attributes."""
     dates = []
     headers = frame.locator("table.logsTbl thead td[currdate]")
     for i in range(headers.count()):
         try:
-            value = headers.nth(i).get_attribute("currdate")
-            if value:
-                dates.append(value)
+            d = headers.nth(i).get_attribute("currdate")
+            if d:
+                dates.append(d)
         except Exception:
             pass
     return dates
 
 
 def _normalized_status(cell):
-    """
-    Normalize only statuses we have positively identified.
-
-    sf2 / vcheck.gif  = normal green check = Present
-    sf4 / vcheckd.gif = red X = Absent
-
-    Other Nigri variants remain 'unknown' until their meaning is confirmed.
-    """
     cls = (cell.get("className") or "").split()
     bg = (cell.get("backgroundImage") or "").lower()
 
     if "sf4" in cls or "vcheckd.gif" in bg:
         return "absent"
+
     if "sf2" in cls and "sf2n" not in cls and "vcheck.gif" in bg:
         return "present"
+
     return "unknown"
 
 
 def read_attendance():
-    """
-    Read up to 60 days of Nigri Attendance History.
-
-    The endpoint returns:
-      - date columns actually present in Nigri
-      - all 16 B3 students
-      - per-date status cells
-      - conservative normalized status (present / absent / unknown)
-      - raw CSS/icon metadata for still-unmapped statuses
-
-    SAFETY: read-only.
-    """
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
@@ -164,17 +126,17 @@ def read_attendance():
         page.wait_for_load_state("networkidle")
         page.wait_for_timeout(1000)
 
-        frame = _set_60_day_history(page)
-        page.wait_for_timeout(750)
+        frame = _find_history_frame(page)
 
-        # If the table is still loading, wait briefly for student rows.
-        try:
-            frame.locator("table.logsTbl tbody tr[childid]").first.wait_for(
-                state="attached", timeout=5000
-            )
-        except Exception:
-            # Reacquire once more in case the frame was replaced.
-            frame = _find_history_frame(page)
+        # Navigate the authenticated inner history frame directly to a clean
+        # 60-day URL so stale custom dates cannot override daysBack=59.
+        clean_url = _build_60_day_url(frame.url)
+        frame.goto(clean_url)
+        frame.wait_for_load_state("networkidle")
+        page.wait_for_timeout(1000)
+
+        # Reacquire in case Nigri replaced the iframe document.
+        frame = _find_history_frame(page)
 
         dates = _read_dates(frame)
         rows = frame.locator("table.logsTbl tbody tr[childid]")
@@ -223,7 +185,6 @@ def read_attendance():
             flags=re.I,
         )
 
-        # Compact summary by student, useful for the unified record.
         summaries = {}
         for student in students:
             counts = {"present": 0, "absent": 0, "unknown": 0}
