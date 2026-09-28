@@ -1090,6 +1090,324 @@ def run_marks_sync(
     return {"test_id": test_id, "results": results}
 
 
+
+# ---------------------------------------------------------------------------
+# READ-ONLY School Marks reader
+# ---------------------------------------------------------------------------
+# This code never creates, edits, saves, or deletes a mark. It only logs in,
+# discovers already-existing mark/test records, opens their existing detail
+# pages, and reads the values that Nigri already has saved.
+
+_MARK_STATUS_LABELS = {
+    "": "present",
+    "0": "present",
+    "1": "absent",
+    "2": "n/a",
+    "3": "excused",
+}
+
+_MARKS_CLASS_STUDENTS = {
+    "B3 ET": {
+        "Chaikin Mayer Chaim",
+        "Gourarie Yossi",
+        "Huebner Sholom DovBer",
+        "Lapine Moshe",
+        "Notik Kehos",
+        "Oirechman Yisroel",
+        "Raichman Moshe Tuvia",
+        "Rosenfeld Avrohom",
+        "Rozmarin Levi",
+        "Traxler Arik",
+    },
+    "B3 WT": {
+        "Greenberg Ari",
+        "Rosenfeld Zev",
+        "Schtroks Levi",
+        "Simmonds Yisroel Aryeh",
+        "Vogel Leibel",
+        "Wolf Yisroel Arye Leib",
+    },
+}
+
+
+def _safe_input_value(page, selector):
+    loc = page.locator(selector)
+    if loc.count() == 0:
+        return None
+    try:
+        return loc.first.input_value()
+    except Exception:
+        return None
+
+
+def _safe_selected_label(page, selector):
+    loc = page.locator(selector)
+    if loc.count() == 0:
+        return None
+    try:
+        return loc.first.evaluate(
+            "el => el.selectedOptions && el.selectedOptions.length "
+            "? el.selectedOptions[0].textContent.trim() : null"
+        )
+    except Exception:
+        return None
+
+
+def _infer_marks_class(student_rows):
+    names = {row.get("name") for row in student_rows}
+    scores = {
+        class_section: len(names & class_names)
+        for class_section, class_names in _MARKS_CLASS_STUDENTS.items()
+    }
+    best = max(scores, key=scores.get) if scores else None
+    return best if best and scores[best] > 0 else None
+
+
+def _read_current_mark_page(page, test_id, discovered_title=None):
+    """Read one already-existing Nigri mark detail page without changing it."""
+    students = []
+
+    for name, child_id in REWARDS_CHILD_IDS.items():
+        mark_selector = f'input[name="testChild_{child_id}_mark"]'
+        status_selector = f'select[name="testChild_{child_id}_markSpecialStatus"]'
+        comment_selector = f'textarea[name="testChild_{child_id}_markComment"]'
+
+        mark_loc = page.locator(mark_selector)
+        status_loc = page.locator(status_selector)
+        comment_loc = page.locator(comment_selector)
+
+        # If no mark/status/comment field exists for this childID, this student
+        # is not part of the mark currently open.
+        if (
+            mark_loc.count() == 0
+            and status_loc.count() == 0
+            and comment_loc.count() == 0
+        ):
+            continue
+
+        mark = None
+        if mark_loc.count():
+            try:
+                raw_mark = mark_loc.first.input_value().strip()
+                mark = raw_mark if raw_mark != "" else None
+            except Exception:
+                pass
+
+        status_value = ""
+        if status_loc.count():
+            try:
+                status_value = status_loc.first.input_value()
+            except Exception:
+                pass
+
+        comment = None
+        if comment_loc.count():
+            try:
+                raw_comment = comment_loc.first.input_value().strip()
+                comment = raw_comment if raw_comment else None
+            except Exception:
+                pass
+
+        students.append(
+            {
+                "name": name,
+                "child_id": child_id,
+                "mark": mark,
+                "status": _MARK_STATUS_LABELS.get(
+                    status_value, status_value or "present"
+                ),
+                "status_value": status_value,
+                "comment": comment,
+            }
+        )
+
+    mark_type = None
+    for value in ("homework", "test", "quiz", "classwork"):
+        loc = page.locator(f"input#testType_{value}")
+        try:
+            if loc.count() and loc.first.is_checked():
+                mark_type = value
+                break
+        except Exception:
+            pass
+
+    title = _safe_input_value(page, 'input[name="testName"]') or discovered_title
+    test_date = _safe_input_value(page, 'input[name="testDate"]')
+    description = _safe_input_value(page, 'textarea[name="testDesc"]')
+    completed = _safe_input_value(page, 'select[name="testCompleted"]')
+    grade = _safe_selected_label(page, "select#testGradeID")
+    topic = _safe_selected_label(page, "select#testTopicID")
+
+    inferred_class = _infer_marks_class(students)
+    if not grade or grade not in MARKS_GRADE_IDS:
+        grade = inferred_class
+
+    return {
+        "test_id": str(test_id),
+        "title": title,
+        "date": test_date,
+        "grade": grade,
+        "topic": topic,
+        "type": mark_type,
+        "description": description,
+        "marking_done": completed == "1" if completed is not None else None,
+        "students": students,
+        "source_url": page.url,
+    }
+
+
+def _discover_existing_mark_links(page):
+    """
+    Discover existing School Marks without clicking anything.
+
+    Prefer Nigri's real links. As a fallback, collect testIDs embedded in the
+    page HTML and try read-only detail URLs for those IDs.
+    """
+    discovered = {}
+
+    try:
+        link_rows = page.eval_on_selector_all(
+            'a[href*="testID="]',
+            """els => els.map(a => ({
+                href: a.href || a.getAttribute('href') || '',
+                text: (a.textContent || '').trim()
+            }))""",
+        )
+    except Exception:
+        link_rows = []
+
+    for item in link_rows:
+        href = (item or {}).get("href") or ""
+        if "del_test" in href.lower():
+            continue
+        match = re.search(r"[?&]testID=(\d+)", href, re.I)
+        if not match or match.group(1) == "0":
+            continue
+        test_id = match.group(1)
+        old = discovered.get(test_id)
+        if old is None or (not old.get("title") and item.get("text")):
+            discovered[test_id] = {
+                "test_id": test_id,
+                "title": (item.get("text") or "").strip() or None,
+                "candidates": [href],
+            }
+
+    # Some Nigri screens put the testID only in inline JavaScript. Collect
+    # those IDs too. Nothing is clicked or submitted here.
+    try:
+        html = page.content()
+    except Exception:
+        html = ""
+
+    for test_id in set(re.findall(r"testID(?:=|%3D)(\d+)", html, flags=re.I)):
+        if test_id == "0":
+            continue
+        entry = discovered.setdefault(
+            test_id, {"test_id": test_id, "title": None, "candidates": []}
+        )
+
+        # These are GET-only candidate detail URLs. They are attempted only if
+        # Nigri did not expose a usable real href for this testID.
+        for candidate in (
+            f"{NIGRI_BASE_URL}/main/default_os_prog.asp"
+            f"?section=teachers&spec=tests&testID={test_id}",
+            f"{NIGRI_BASE_URL}/main/default_os_prog.asp"
+            f"?section=teachers&spec=tests&action=edit_test&testID={test_id}",
+            f"{MARKS_URL}&testID={test_id}",
+        ):
+            if candidate not in entry["candidates"]:
+                entry["candidates"].append(candidate)
+
+    found = list(discovered.values())
+    found.sort(key=lambda item: int(item["test_id"]), reverse=True)
+    return found
+
+
+def read_marks(class_section=None, limit=100):
+    """
+    Read existing School Marks from Nigri.
+
+    class_section:
+      "B3 ET", "B3 WT", or None for both classes.
+
+    limit:
+      Maximum number of existing marks to return in one request.
+
+    SAFETY: read-only. No Create Mark, Save!, delete, or write controls are
+    clicked or submitted anywhere in this function.
+    """
+    if class_section is not None and class_section not in MARKS_GRADE_IDS:
+        raise ValueError(f"Unknown class_section: {class_section}")
+
+    try:
+        limit = max(1, min(int(limit), 250))
+    except Exception:
+        limit = 100
+
+    marks = []
+    errors = []
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+
+        login(page)
+        page.goto(MARKS_URL)
+        page.wait_for_load_state("networkidle")
+        page.wait_for_timeout(500)
+
+        found = _discover_existing_mark_links(page)
+
+        for item in found:
+            if len(marks) >= limit:
+                break
+
+            last_error = None
+            mark = None
+
+            for candidate in item.get("candidates") or []:
+                try:
+                    page.goto(candidate)
+                    page.wait_for_load_state("networkidle")
+                    page.wait_for_timeout(250)
+
+                    candidate_mark = _read_current_mark_page(
+                        page,
+                        test_id=item["test_id"],
+                        discovered_title=item.get("title"),
+                    )
+                    if candidate_mark["students"]:
+                        mark = candidate_mark
+                        break
+                except Exception as e:
+                    last_error = str(e)
+
+            if mark is None:
+                errors.append(
+                    {
+                        "test_id": item["test_id"],
+                        "title": item.get("title"),
+                        "error": last_error or "No readable student mark fields found.",
+                    }
+                )
+                continue
+
+            if class_section and mark.get("grade") != class_section:
+                continue
+
+            marks.append(mark)
+
+        browser.close()
+
+    return {
+        "class_section": class_section,
+        "count": len(marks),
+        "marks": marks,
+        "errors": errors,
+        "discovered_test_ids": len(found),
+        "read_only": True,
+    }
+
 # A tiny, valid, hand-built one-page PDF ("TEST REPORT ATTACHMENT") used
 # ONLY by debug_marks_full_flow's with_report option, to safely confirm
 # Playwright's set_input_files() (used by fill_student_mark for the real

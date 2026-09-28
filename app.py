@@ -17,6 +17,7 @@ from flask_cors import CORS
 from nigri_playwright import (
     run_sync,
     run_marks_sync,
+    read_marks,
     debug_attendance_page,
     debug_points_attempt,
     debug_rewards_page,
@@ -272,6 +273,45 @@ def sync_marks():
     except Exception as e:
         return jsonify({"status": "error", "detail": str(e)}), 500
 
+
+
+@app.route("/read-marks", methods=["GET", "POST"])
+def read_marks_endpoint():
+    """
+    Authenticated read-only endpoint for existing Nigri School Marks.
+
+    POST:
+      {"class_section": "B3 ET", "limit": 100}
+
+    GET:
+      /read-marks?key=...&class=B3%20ET&limit=100
+
+    Omit class/class_section to return both B3 ET and B3 WT.
+    """
+    provided_key = request.headers.get("X-Sync-Key") or request.args.get("key")
+    if not SYNC_API_KEY or provided_key != SYNC_API_KEY:
+        return jsonify({"error": "unauthorized"}), 401
+
+    if request.method == "POST":
+        body = request.get_json(force=True, silent=True) or {}
+        class_section = body.get("class_section")
+        limit = body.get("limit", 100)
+    else:
+        class_section = request.args.get("class") or None
+        limit = request.args.get("limit", 100)
+
+    if class_section == "":
+        class_section = None
+    if class_section not in (None, "B3 ET", "B3 WT"):
+        return jsonify(
+            {"error": "class_section must be B3 ET, B3 WT, or omitted"}
+        ), 400
+
+    try:
+        result = read_marks(class_section=class_section, limit=limit)
+        return jsonify({"status": "success", **result})
+    except Exception as e:
+        return jsonify({"status": "error", "detail": str(e)}), 500
 
 @app.route("/debug-marks-full", methods=["GET", "POST"])
 def debug_marks_full():
