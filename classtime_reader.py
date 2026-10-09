@@ -20,7 +20,7 @@ def test_session(session_code, inspect_exports=False, review_section=None):
         text = page.locator('body').inner_text().lower()
         return any(s in text for s in ('verify you are human', 'checking your browser', 'unusual traffic', 'automated traffic', 'access denied')) or page.locator('iframe[src*="recaptcha"], iframe[src*="hcaptcha"], iframe[src*="challenges.cloudflare"]').count() > 0
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(headless=True, args=['--single-process', '--no-zygote'])
         context = browser.new_context()
         context.route('**/*', lambda route: route.abort() if route.request.resource_type in ('image', 'media', 'font') else route.continue_())
         page = context.new_page()

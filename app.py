@@ -79,6 +79,26 @@ def classtime_create_review():
         return jsonify({"error": str(e)}), 409
 
 
+@app.route("/classtime/reviews/import", methods=["POST"])
+def classtime_import_review():
+    from classtime_auth import review_owner
+    from classtime_review import import_review_archive, store_review
+    owner = review_owner()
+    if not owner: return jsonify({"error": "unauthorized"}), 401
+    if request.content_length is None or request.content_length > 40 * 1024 * 1024:
+        return jsonify({"error": "Archive exceeds the size limit"}), 413
+    try:
+        result, pdfs = import_review_archive(request.get_data())
+        key = store_review(owner, result, pdfs)
+        response = jsonify({"review_id": key, "result": result, "read_only": True, "sync_enabled": False})
+        response.headers["Cache-Control"] = "no-store"
+        return response, 201
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception:
+        return jsonify({"error": "Archive could not be verified"}), 400
+
+
 @app.route("/classtime/reviews/<review_id>", methods=["GET"])
 def classtime_get_review(review_id):
     from classtime_auth import review_owner

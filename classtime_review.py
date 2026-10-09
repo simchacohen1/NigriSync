@@ -121,3 +121,70 @@ def get_review(key, owner):
         job = JOBS.get(key)
         if not job or job['owner'] != owner or job['expires'] < time.time(): return None
         return job.copy()
+
+
+def import_review_archive(data):
+    """Restore an owner-supplied review; reverify mappings and original PDF contents."""
+    import json
+    import zipfile
+    import math
+    if len(data) > 40 * 1024 * 1024: raise ValueError('Archive exceeds the size limit')
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            entries = archive.infolist()
+            if len(entries) > 102 or sum(e.file_size for e in entries) > 40 * 1024 * 1024:
+                raise ValueError('Archive exceeds the verification limits')
+            metadata = [e for e in entries if e.filename == 'review.json']
+            if len(metadata) != 1 or metadata[0].file_size > 200000:
+                raise ValueError('Use a saved review ZIP containing review.json')
+            source = json.loads(archive.read(metadata[0]))
+            code, section = source.get('session_code'), source.get('class_section')
+            if not isinstance(code, str) or not re.fullmatch(r'[A-Z0-9]{6}', code) or section not in ('B3 ET', 'B3 WT'):
+                raise ValueError('Invalid session or class')
+            rows = source.get('students')
+            if not isinstance(rows, list) or not 0 < len(rows) <= 100: raise ValueError('Invalid roster')
+            students, seen = [], set()
+            for row in rows:
+                name = row.get('classtime_name')
+                if not isinstance(name, str) or not 0 < len(name) <= 120: raise ValueError('Invalid student name')
+                mapping = match_student(name, section)
+                if not mapping or mapping['child_id'] in seen: raise ValueError('Unknown or duplicate class mapping')
+                seen.add(mapping['child_id'])
+                maximum, points = row.get('maximum_points'), row.get('points')
+                if type(maximum) not in (int, float) or not math.isfinite(maximum) or maximum <= 0: raise ValueError('Invalid maximum points')
+                if points is not None and (type(points) not in (int, float) or not math.isfinite(points) or not 0 <= points <= maximum): raise ValueError('Invalid points')
+                origin = row.get('source_session', code)
+                if not isinstance(origin, str) or not re.fullmatch(r'[A-Z0-9]{6}', origin): raise ValueError('Invalid source session')
+                students.append(dict(classtime_name=name, nigri=mapping, points=points, maximum_points=maximum,
+                    percentage=None if points is None else round(points / maximum * 100, 2), source_session=origin, pdf_status='pending'))
+            pdfs = {}
+            for entry in entries:
+                if entry.is_dir() or not entry.filename.lower().endswith('.pdf'): continue
+                if entry.file_size > 8 * 1024 * 1024: raise ValueError('PDF is too large')
+                report = archive.read(entry)
+                student, _ = verify_pdf(report, students)
+                verify_pdf(report, [student], student['source_session'], section)
+                if student['pdf_status'] == 'verified': raise ValueError('Duplicate student report')
+                key = uuid.uuid4().hex
+                student.update(pdf_status='verified', pdf_id=key, pdf_filename=entry.filename.rsplit('/', 1)[-1],
+                    pdf_sha256=hashlib.sha256(report).hexdigest(), pdf_identity=student['classtime_name'])
+                pdfs[key] = report
+            for student in students:
+                if student['pdf_status'] != 'verified': student.update(pdf_status='missing', pdf_detail='No verified report in this archive')
+            result = dict(session_code=code, session_name=str(source.get('session_name', code))[:200], class_section=section,
+                students=students, retrieved_at=source.get('retrieved_at'), archive_report_count=len(pdfs),
+                source_sessions=sorted({s['source_session'] for s in students}), restored_from_archive=True,
+                read_only=True, sync_enabled=False, nigri_writes=False)
+            return result, pdfs
+    except (zipfile.BadZipFile, json.JSONDecodeError, KeyError, TypeError, AttributeError):
+        raise ValueError('Invalid saved review archive') from None
+
+
+def store_review(owner, result, pdfs):
+    with LOCK:
+        if any(j['status'] == 'loading' for j in JOBS.values()):
+            raise ValueError('Wait for the active retrieval to finish')
+        JOBS.clear()
+        key = uuid.uuid4().hex
+        JOBS[key] = dict(owner=owner, expires=time.time() + TTL, status='ready', result=result, pdfs=pdfs)
+        return key
