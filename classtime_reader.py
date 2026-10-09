@@ -40,7 +40,7 @@ def test_session(session_code):
             stage = 'reading_session'
             page.goto('https://www.classtime.com/sessions/' + session_code, wait_until='domcontentloaded', timeout=45000)
             # Wait for the SPA to render a session heading or its access error.
-            page.wait_for_function("document.body.innerText.trim().length > 100", timeout=30000)
+            page.wait_for_function("""(code) => { const t = document.body.innerText; return t.includes(code) || t.includes('Shorashim') || /session not found|do not have access|permission denied/i.test(t); }""", arg=session_code, timeout=45000)
             page.wait_for_timeout(3000)
             if blocked(page):
                 return {'status': 'blocked', 'stage': stage, 'nigri_writes': False}
