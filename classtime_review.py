@@ -196,9 +196,12 @@ def store_review(owner, result, pdfs):
 
 def attach_archive_reports(review, archive_path):
     """Keep PDFs on private temporary disk; parse only one bounded report at a time."""
+    import gc
     import tempfile
     import zipfile
     import shutil
+    from browser_runtime import log_memory
+    log_memory('PDF verification starting (no browser running)')
     folder = Path(tempfile.mkdtemp(prefix='classtime-reports-'))
     folder.chmod(0o700)
     pdfs = {}
@@ -225,6 +228,8 @@ def attach_archive_reports(review, archive_path):
                 student.update(pdf_status='verified', pdf_id=key, source_session=origin,
                     pdf_filename=entry.filename.rsplit('/', 1)[-1], pdf_sha256=digest.hexdigest(), pdf_identity=student['classtime_name'])
                 pdfs[key] = str(path)
+                gc.collect()  # release this PDF's parsed pages before reading the next one
+                log_memory('PDF ' + str(len(pdfs)) + '/' + str(len(entries)) + ' verified')
         for student in review['students']:
             if student['pdf_status'] != 'verified': student.update(pdf_status='missing', pdf_detail='No verified report in this archive')
         review['archive_report_count'] = len(pdfs)

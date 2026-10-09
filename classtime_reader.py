@@ -6,6 +6,23 @@ import re
 from playwright.sync_api import sync_playwright, TimeoutError as BrowserTimeout
 
 
+def _chromium_args():
+    """Memory-saving Chromium flags for the 512 MiB Render Starter service."""
+    args = [
+        '--disable-dev-shm-usage',        # use /tmp, not the tiny /dev/shm, for shared memory
+        '--disable-gpu', '--disable-software-rasterizer',
+        '--disable-extensions', '--disable-background-networking', '--disable-component-update',
+        '--disable-sync', '--disable-default-apps', '--mute-audio', '--no-first-run',
+        '--js-flags=--max-old-space-size=96',
+    ]
+    # Single-process Chromium saves a lot of RAM but is not officially supported.
+    # It stays ON (as before); set CLASSTIME_CHROMIUM_SINGLE_PROCESS=0 in Render to
+    # switch to normal multi-process mode if the browser ever crashes.
+    if os.environ.get('CLASSTIME_CHROMIUM_SINGLE_PROCESS', '1') != '0':
+        args = ['--single-process', '--no-zygote'] + args
+    return args
+
+
 def test_session(session_code, inspect_exports=False, review_section=None):
     from browser_runtime import run_browser
     return run_browser(_test_session, session_code, inspect_exports=inspect_exports, review_section=review_section)
@@ -24,19 +41,25 @@ def _test_session(session_code, inspect_exports=False, review_section=None):
     def blocked(page):
         text = page.locator('body').inner_text().lower()
         return any(s in text for s in ('verify you are human', 'checking your browser', 'unusual traffic', 'automated traffic', 'access denied')) or page.locator('iframe[src*="recaptcha"], iframe[src*="hcaptcha"], iframe[src*="challenges.cloudflare"]').count() > 0
+    from browser_runtime import log_memory
     # Limit the Playwright Node driver independently of the Chromium V8 heap.
     os.environ['NODE_OPTIONS'] = '--max-old-space-size=64'
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=['--single-process', '--no-zygote', '--js-flags=--max-old-space-size=96'])
+        log_memory('playwright driver started')
+        browser = p.chromium.launch(headless=True, args=_chromium_args())
+        log_memory('chromium launched')
         context = browser.new_context()
+        # Images, media and fonts are never needed to read grades or export reports.
         context.route('**/*', lambda route: route.abort() if route.request.resource_type in ('image', 'media', 'font') else route.continue_())
         page = context.new_page()
         page.set_default_timeout(15000)
+        log_memory('page ready')
         try:
             page.goto('https://www.classtime.com/auth/login', wait_until='domcontentloaded', timeout=45000)
             page.get_by_role('textbox', name='Email', exact=True).wait_for()
             if blocked(page):
                 return {'status': 'blocked', 'stage': stage, 'detail': 'Human verification or access restriction; no bypass attempted', 'nigri_writes': False}
+            log_memory('login page loaded')
             stage = 'logging_in'
             if review_section: print('Classtime review: logging in', flush=True)
             page.get_by_role('textbox', name='Email', exact=True).fill(email)
@@ -46,12 +69,14 @@ def _test_session(session_code, inspect_exports=False, review_section=None):
                 page.wait_for_url(lambda url: '/auth/' not in url, timeout=30000)
             except BrowserTimeout:
                 return {'status': 'blocked' if blocked(page) else 'login_failed', 'stage': stage, 'detail': 'Login did not reach an authenticated page. No retry or bypass attempted.', 'nigri_writes': False}
+            log_memory('logged in')
             stage = 'reading_session'
             if review_section: print('Classtime review: reading session', flush=True)
             page.goto('https://www.classtime.com/sessions/' + session_code, wait_until='domcontentloaded', timeout=45000)
             # Wait for the SPA to render a session heading or its access error.
             page.wait_for_function("""(code) => { const t = document.body.innerText; return t.includes(code) || t.includes('Shorashim') || /session not found|do not have access|permission denied/i.test(t); }""", arg=session_code, timeout=90000)
             page.wait_for_timeout(3000)
+            log_memory('session page rendered')
             if blocked(page):
                 return {'status': 'blocked', 'stage': stage, 'nigri_writes': False}
             if review_section:
@@ -75,6 +100,7 @@ def _test_session(session_code, inspect_exports=False, review_section=None):
                 context.close()
             finally:
                 browser.close()
+                log_memory('browser closed')
 
 
 def load_review(session_code, class_section):
@@ -108,9 +134,11 @@ def _collect_review(page, code, section):
     from datetime import datetime, timezone
     from pathlib import Path
     from classtime_review import parse_session
+    from browser_runtime import log_memory
     text = page.locator('body').inner_text()
     rows = page.locator('tr, [role="row"]').all_inner_texts()
     result = parse_session(rows, text, code, section)
+    log_memory('grades parsed')
     print("Classtime review: opening export", flush=True)
     page.locator('[aria-label="Export"] button').click()
     page.wait_for_timeout(1000)
@@ -126,6 +154,7 @@ def _collect_review(page, code, section):
         picker_text = dialogs.last.inner_text()
         result['pdf_export_offered_names'] = [student['classtime_name'] for student in result['students'] if student['classtime_name'] in picker_text]
         result['pdf_export_observation'] = picker_text[:5000]
+    log_memory('export menu open')
     print("Classtime review: downloading ZIP", flush=True)
     with page.expect_download(timeout=150000) as download_info:
         archive.click()
@@ -134,6 +163,7 @@ def _collect_review(page, code, section):
     target = Path(folder) / 'reports.zip'
     try:
         download.save_as(str(target))
+        log_memory('report ZIP saved to disk')
         if target.stat().st_size > 20 * 1024 * 1024: raise ValueError('Report archive exceeds the size limit')
         result['retrieved_at'] = datetime.now(timezone.utc).isoformat()
         return result, str(target)
