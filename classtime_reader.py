@@ -20,7 +20,7 @@ def test_session(session_code, inspect_exports=False, review_section=None):
         text = page.locator('body').inner_text().lower()
         return any(s in text for s in ('verify you are human', 'checking your browser', 'unusual traffic', 'automated traffic', 'access denied')) or page.locator('iframe[src*="recaptcha"], iframe[src*="hcaptcha"], iframe[src*="challenges.cloudflare"]').count() > 0
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--disable-gpu", "--disable-software-rasterizer", "--renderer-process-limit=1"])
+        browser = p.chromium.launch(headless=True, args=["--disable-gpu", "--renderer-process-limit=1"])
         context = browser.new_context()
         context.route('**/*', lambda route: route.abort() if route.request.resource_type in ('image', 'media', 'font') else route.continue_())
         page = context.new_page()
@@ -43,7 +43,7 @@ def test_session(session_code, inspect_exports=False, review_section=None):
             if review_section: print('Classtime review: reading session', flush=True)
             page.goto('https://www.classtime.com/sessions/' + session_code, wait_until='domcontentloaded', timeout=45000)
             # Wait for the SPA to render a session heading or its access error.
-            page.wait_for_function("""(code) => { const t = document.body.innerText; return t.includes(code) || t.includes('Shorashim') || /session not found|do not have access|permission denied/i.test(t); }""", arg=session_code, timeout=45000)
+            page.wait_for_function("""(code) => { const t = document.body.innerText; return t.includes(code) || t.includes('Shorashim') || /session not found|do not have access|permission denied/i.test(t); }""", arg=session_code, timeout=90000)
             page.wait_for_timeout(3000)
             if blocked(page):
                 return {'status': 'blocked', 'stage': stage, 'nigri_writes': False}
@@ -55,7 +55,7 @@ def test_session(session_code, inspect_exports=False, review_section=None):
             rows = page.locator('tr, [role="row"]').all_inner_texts()
             return {'status': 'login_succeeded' if '/auth/' not in page.url else 'session_access_denied', 'session_code': session_code, 'stage': stage, 'page_title': clean(page.title()), 'visible_text': text[:24000], 'visible_rows': [clean(row) for row in rows][:200], 'nigri_writes': False, 'note': 'Diagnostic observations only; names and grades require verification before integration.'}
         except BrowserTimeout:
-            if review_section: raise ValueError('Classtime did not finish loading the session or report export. No Nigri grades were changed.')
+            if review_section: raise ValueError('Classtime timed out at ' + stage + '. No Nigri grades were changed. Observed page: ' + clean(page.locator('body').inner_text())[:1200])
             return {'status': 'timeout', 'stage': stage, 'detail': 'Classtime page did not finish the required step', 'nigri_writes': False}
         except Exception as exc:
             if review_section:
