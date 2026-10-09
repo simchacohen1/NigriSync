@@ -81,6 +81,18 @@ def start_review(owner, code, section, loader):
     with LOCK:
         for key in list(JOBS):
             if JOBS[key]['expires'] < now: del JOBS[key]
+        # Only the verified website owner and the internal diagnostic can
+        # create jobs. Reuse the same retrieved source without another browser.
+        for prior in list(JOBS.values()):
+            result = prior.get('result', {})
+            if prior['status'] == 'ready' and result.get('session_code') == code and result.get('class_section') == section:
+                key = uuid.uuid4().hex
+                JOBS[key] = dict(prior, owner=owner)
+                return key
+        # Keep at most two distinct report sets to bound resident memory.
+        ready = [key for key, job in JOBS.items() if job['status'] != 'loading']
+        while len(ready) >= 2:
+            del JOBS[ready.pop(0)]
         active = [j for j in JOBS.values() if j['status'] == 'loading']
         if active: raise ValueError('A review is already loading. Please wait for it to finish.')
         key = uuid.uuid4().hex
