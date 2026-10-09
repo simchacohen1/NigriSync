@@ -34,6 +34,25 @@ CORS(app, resources={
     r"/(?!classtime/).*": {"origins": "*"},  # Preserve existing Attendance/Weekly Quiz behavior.
 })
 
+# Existing browser routes share the same cross-process slot with Classtime.
+# Their authentication and Nigri behavior are unchanged; a busy service returns 409.
+@app.before_request
+def serialize_existing_browser_routes():
+    if request.path in ('/health',) or request.path.startswith('/classtime/') or request.method == 'OPTIONS': return
+    from browser_runtime import browser_slot
+    from flask import g
+    slot = browser_slot()
+    try: slot.__enter__()
+    except ValueError as exc: return jsonify({"error": str(exc)}), 409
+    g.browser_slot = slot
+
+@app.teardown_request
+def release_browser_slot(error):
+    from flask import g
+    slot = g.pop('browser_slot', None)
+    if slot: slot.__exit__(None, None, None)
+
+
 SYNC_API_KEY = os.environ.get("SYNC_API_KEY")
 
 
@@ -51,7 +70,10 @@ def classtime_test_session():
     import re
     if not re.fullmatch(r"[A-Z0-9]{6}", code):
         return jsonify({"error": "A six-character session code is required"}), 400
-    response = jsonify(test_session(code, inspect_exports=body.get("inspect_exports") is True))
+    try:
+        response = jsonify(test_session(code, inspect_exports=body.get("inspect_exports") is True))
+    except ValueError as exc:
+        response = jsonify({"status": "stopped", "detail": str(exc), "nigri_writes": False})
     response.headers["Cache-Control"] = "no-store"
     return response
 
@@ -85,10 +107,19 @@ def classtime_import_review():
     from classtime_review import import_review_archive, store_review
     owner = review_owner()
     if not owner: return jsonify({"error": "unauthorized"}), 401
-    if request.content_length is None or request.content_length > 40 * 1024 * 1024:
+    if request.content_length is None or request.content_length > 20 * 1024 * 1024:
         return jsonify({"error": "Archive exceeds the size limit"}), 413
     try:
-        result, pdfs = import_review_archive(request.get_data())
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory(prefix='classtime-upload-') as folder:
+            path = Path(folder) / 'review.zip'
+            with path.open('wb') as output:
+                import shutil
+                shutil.copyfileobj(request.stream, output, length=65536)
+            from browser_runtime import browser_slot
+            with browser_slot():
+                result, pdfs = import_review_archive(path)
         key = store_review(owner, result, pdfs)
         response = jsonify({"review_id": key, "result": result, "read_only": True, "sync_enabled": False})
         response.headers["Cache-Control"] = "no-store"
@@ -116,13 +147,13 @@ def classtime_get_review(review_id):
 def classtime_review_pdf(review_id, pdf_id):
     from classtime_auth import review_owner
     from classtime_review import get_review
-    from flask import Response
+    from flask import send_file
     owner = review_owner()
     if not owner: return jsonify({"error": "unauthorized"}), 401
     job = get_review(review_id, owner)
     report = job and job["pdfs"].get(pdf_id)
     if not report: return jsonify({"error": "PDF expired or unavailable"}), 404
-    response = Response(report, mimetype="application/pdf")
+    response = send_file(report, mimetype="application/pdf", conditional=False, max_age=0)
     response.headers["Cache-Control"] = "no-store"
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["Content-Disposition"] = 'inline; filename="student-report.pdf"'

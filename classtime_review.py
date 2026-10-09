@@ -1,5 +1,6 @@
 """Read-only session review, explicit class-scoped matching and PDF verification."""
 import io
+from pathlib import Path
 import re
 import time
 import uuid
@@ -58,13 +59,21 @@ def parse_session(rows, text, code, section):
     return {'session_code': code, 'session_name': title.group(1), 'class_section': section, 'students': students, 'read_only': True, 'sync_enabled': False, 'nigri_writes': False}
 
 def verify_pdf(data, students, session_code=None, class_section=None):
-    if len(data) > 8 * 1024 * 1024 or not data.startswith(b'%PDF-'):
+    is_path = isinstance(data, Path)
+    size = data.stat().st_size if is_path else len(data)
+    if is_path:
+        with data.open('rb') as source: magic = source.read(5)
+    else: magic = data[:5]
+    if size > 8 * 1024 * 1024 or magic != b'%PDF-':
         raise ValueError('Invalid or oversized PDF')
     from pypdf import PdfReader
-    pdf = PdfReader(io.BytesIO(data))
+    pdf = PdfReader(str(data) if is_path else io.BytesIO(data))
     if pdf.is_encrypted or not 0 < len(pdf.pages) <= 100:
         raise ValueError('PDF cannot be verified')
-    text = '\n'.join(page.extract_text() or '' for page in pdf.pages)
+    try:
+        text = '\n'.join(page.extract_text() or '' for page in pdf.pages)
+    finally:
+        pdf.close()
     # Verify the student identity in the PDF contents, never just its filename.
     normalized = ' ' + normalize(text) + ' '
     matches = [s for s in students if ' ' + normalize(s['classtime_name']) + ' ' in normalized]
@@ -90,6 +99,11 @@ def start_review(owner, code, section, loader):
     with LOCK:
         for key in list(JOBS):
             if JOBS[key]['expires'] < now: del JOBS[key]
+        referenced = {str(Path(p).parent) for job in JOBS.values() for p in job.get('pdfs', {}).values()}
+        import shutil
+        for folder in Path('/tmp').glob('classtime-reports-*'):
+            if str(folder) not in referenced and now - folder.stat().st_mtime > TTL:
+                shutil.rmtree(folder, ignore_errors=True)
         # Only the verified website owner and the internal diagnostic can
         # create jobs. Reuse the same retrieved source without another browser.
         for prior in list(JOBS.values()):
@@ -128,9 +142,10 @@ def import_review_archive(data):
     import json
     import zipfile
     import math
-    if len(data) > 40 * 1024 * 1024: raise ValueError('Archive exceeds the size limit')
+    size = data.stat().st_size if isinstance(data, Path) else len(data)
+    if size > 20 * 1024 * 1024: raise ValueError('Archive exceeds the size limit')
     try:
-        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        with zipfile.ZipFile(data if isinstance(data, Path) else io.BytesIO(data)) as archive:
             entries = archive.infolist()
             if len(entries) > 102 or sum(e.file_size for e in entries) > 40 * 1024 * 1024:
                 raise ValueError('Archive exceeds the verification limits')
@@ -157,25 +172,11 @@ def import_review_archive(data):
                 if not isinstance(origin, str) or not re.fullmatch(r'[A-Z0-9]{6}', origin): raise ValueError('Invalid source session')
                 students.append(dict(classtime_name=name, nigri=mapping, points=points, maximum_points=maximum,
                     percentage=None if points is None else round(points / maximum * 100, 2), source_session=origin, pdf_status='pending'))
-            pdfs = {}
-            for entry in entries:
-                if entry.is_dir() or not entry.filename.lower().endswith('.pdf'): continue
-                if entry.file_size > 8 * 1024 * 1024: raise ValueError('PDF is too large')
-                report = archive.read(entry)
-                student, _ = verify_pdf(report, students)
-                verify_pdf(report, [student], student['source_session'], section)
-                if student['pdf_status'] == 'verified': raise ValueError('Duplicate student report')
-                key = uuid.uuid4().hex
-                student.update(pdf_status='verified', pdf_id=key, pdf_filename=entry.filename.rsplit('/', 1)[-1],
-                    pdf_sha256=hashlib.sha256(report).hexdigest(), pdf_identity=student['classtime_name'])
-                pdfs[key] = report
-            for student in students:
-                if student['pdf_status'] != 'verified': student.update(pdf_status='missing', pdf_detail='No verified report in this archive')
             result = dict(session_code=code, session_name=str(source.get('session_name', code))[:200], class_section=section,
-                students=students, retrieved_at=source.get('retrieved_at'), archive_report_count=len(pdfs),
+                students=students, retrieved_at=source.get('retrieved_at'), archive_report_count=0,
                 source_sessions=sorted({s['source_session'] for s in students}), restored_from_archive=True,
                 read_only=True, sync_enabled=False, nigri_writes=False)
-            return result, pdfs
+            return attach_archive_reports(result, data)
     except (zipfile.BadZipFile, json.JSONDecodeError, KeyError, TypeError, AttributeError):
         raise ValueError('Invalid saved review archive') from None
 
@@ -184,7 +185,50 @@ def store_review(owner, result, pdfs):
     with LOCK:
         if any(j['status'] == 'loading' for j in JOBS.values()):
             raise ValueError('Wait for the active retrieval to finish')
+        old_folders = {str(Path(p).parent) for job in JOBS.values() for p in job.get('pdfs', {}).values()}
         JOBS.clear()
+        import shutil
+        for folder in old_folders: shutil.rmtree(folder, ignore_errors=True)
         key = uuid.uuid4().hex
         JOBS[key] = dict(owner=owner, expires=time.time() + TTL, status='ready', result=result, pdfs=pdfs)
         return key
+
+
+def attach_archive_reports(review, archive_path):
+    """Keep PDFs on private temporary disk; parse only one bounded report at a time."""
+    import tempfile
+    import zipfile
+    import shutil
+    folder = Path(tempfile.mkdtemp(prefix='classtime-reports-'))
+    folder.chmod(0o700)
+    pdfs = {}
+    try:
+        with zipfile.ZipFile(archive_path if isinstance(archive_path, Path) else io.BytesIO(archive_path)) as archive:
+            entries = [e for e in archive.infolist() if not e.is_dir() and e.filename.lower().endswith('.pdf')]
+            if len(entries) > 100 or sum(e.file_size for e in entries) > 20 * 1024 * 1024:
+                raise ValueError('Archive exceeds verification limits')
+            for entry in entries:
+                if entry.file_size > 8 * 1024 * 1024: raise ValueError('PDF is too large')
+                key = uuid.uuid4().hex
+                path = folder / (key + '.pdf')
+                # Generated filename avoids archive path traversal entirely.
+                with archive.open(entry) as source, path.open('wb') as output:
+                    shutil.copyfileobj(source, output, length=65536)
+                path.chmod(0o600)
+                student, _ = verify_pdf(path, review['students'])
+                origin = student.get('source_session', review['session_code'])
+                verify_pdf(path, [student], origin, review['class_section'])
+                if student['pdf_status'] == 'verified': raise ValueError('Duplicate student report')
+                digest = hashlib.sha256()
+                with path.open('rb') as source:
+                    for chunk in iter(lambda: source.read(65536), b''): digest.update(chunk)
+                student.update(pdf_status='verified', pdf_id=key, source_session=origin,
+                    pdf_filename=entry.filename.rsplit('/', 1)[-1], pdf_sha256=digest.hexdigest(), pdf_identity=student['classtime_name'])
+                pdfs[key] = str(path)
+        for student in review['students']:
+            if student['pdf_status'] != 'verified': student.update(pdf_status='missing', pdf_detail='No verified report in this archive')
+        review['archive_report_count'] = len(pdfs)
+        return review, pdfs
+    except Exception:
+        shutil.rmtree(folder, ignore_errors=True)
+        raise

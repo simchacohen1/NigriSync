@@ -7,6 +7,11 @@ from playwright.sync_api import sync_playwright, TimeoutError as BrowserTimeout
 
 
 def test_session(session_code, inspect_exports=False, review_section=None):
+    from browser_runtime import run_browser
+    return run_browser(_test_session, session_code, inspect_exports=inspect_exports, review_section=review_section)
+
+
+def _test_session(session_code, inspect_exports=False, review_section=None):
     if not re.fullmatch(r'[A-Z0-9]{6}', session_code):
         raise ValueError('A six-character session code is required')
     email = os.environ.get('CLASSTIME_EMAIL')
@@ -64,8 +69,10 @@ def test_session(session_code, inspect_exports=False, review_section=None):
             # Never return raw exceptions, URLs, cookies, traces or credential-bearing HTML.
             return {'status': 'error', 'stage': stage, 'detail': 'Read-only browser test failed; no credentials included in diagnostics', 'nigri_writes': False}
         finally:
-            context.close()
-            browser.close()
+            try:
+                context.close()
+            finally:
+                browser.close()
 
 
 def load_review(session_code, class_section):
@@ -75,24 +82,16 @@ def load_review(session_code, class_section):
     result = test_session(session_code, review_section=class_section)
     if not isinstance(result, tuple):
         raise ValueError('Classtime access failed at ' + str(result.get('stage', result.get('status', 'login'))) + '. No bypass attempted.')
-    review, raw_reports = result
-    # Chromium has closed before PDF parsing, reducing peak memory on Render.
-    pdfs = {}
-    for filename, data in raw_reports:
-        try:
-            student, pdf_text = verify_pdf(data, review['students'], session_code, class_section)
-        except ValueError:
-            raise ValueError('A PDF could not be uniquely matched by its contents. No PDF was assigned by filename.') from None
-        if student['pdf_status'] == 'verified': raise ValueError('Two reports claim the same student identity')
-        pdf_id = uuid.uuid4().hex
-        student.update(pdf_status='verified', pdf_id=pdf_id, pdf_filename=filename, pdf_sha256=hashlib.sha256(data).hexdigest(), pdf_identity=student['classtime_name'])
-        pdfs[pdf_id] = data
-    for student in review['students']:
-        if student['pdf_status'] != 'verified':
-            offered = review.get('pdf_export_offered_names')
-            detail = 'Classtime did not offer a PDF for this student in its export list' if offered is not None and student['classtime_name'] not in offered else 'Classtime did not include a report for this student'
-            student.update(pdf_status='missing', pdf_detail=detail)
-    return review, pdfs
+    review, archive_path = result
+    from classtime_review import attach_archive_reports
+    from pathlib import Path
+    try:
+        from browser_runtime import browser_slot
+        with browser_slot():
+            return attach_archive_reports(review, Path(archive_path))
+    finally:
+        import shutil
+        shutil.rmtree(str(Path(archive_path).parent), ignore_errors=True)
 
 
 def _export_controls(page):
@@ -133,18 +132,14 @@ def _collect_review(page, code, section):
     with page.expect_download(timeout=150000) as download_info:
         archive.click()
     download = download_info.value
-    with tempfile.TemporaryDirectory() as folder:
-        target = Path(folder) / 'reports.zip'
+    folder = tempfile.mkdtemp(prefix='classtime-download-')
+    target = Path(folder) / 'reports.zip'
+    try:
         download.save_as(str(target))
-        if target.stat().st_size > 40 * 1024 * 1024: raise ValueError('Report archive exceeds the size limit')
-        raw_reports = []
-        with zipfile.ZipFile(target) as archive_file:
-            entries = [entry for entry in archive_file.infolist() if not entry.is_dir() and entry.filename.lower().endswith('.pdf')]
-            if len(entries) > 100 or sum(entry.file_size for entry in entries) > 40 * 1024 * 1024:
-                raise ValueError('Report archive exceeds the verification limits')
-            for entry in entries:
-                if entry.file_size > 8 * 1024 * 1024: raise ValueError('Individual report is too large')
-                raw_reports.append((Path(entry.filename).name, archive_file.read(entry)))
+        if target.stat().st_size > 20 * 1024 * 1024: raise ValueError('Report archive exceeds the size limit')
         result['retrieved_at'] = datetime.now(timezone.utc).isoformat()
-        result['archive_report_count'] = len(entries)
-        return result, raw_reports
+        return result, str(target)
+    except Exception:
+        import shutil
+        shutil.rmtree(folder, ignore_errors=True)
+        raise
