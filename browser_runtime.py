@@ -75,7 +75,7 @@ def run_browser(target, *args, **kwargs):
                 if not process.is_alive(): raise ValueError('Classtime browser exited. No Nigri data was changed.')
         finally:
             receive.close(); _stop(process)
-            print('Classtime browser cleanup complete; peak service memory MiB=' + str(round(peak / 1024 / 1024, 1)), flush=True)
+            print('Classtime operation cleanup complete; peak service memory MiB=' + str(round(peak / 1024 / 1024, 1)), flush=True)
 
 
 def resource_status():

@@ -78,9 +78,6 @@ def _test_session(session_code, inspect_exports=False, review_section=None):
 
 
 def load_review(session_code, class_section):
-    from classtime_review import verify_pdf
-    import uuid
-    import hashlib
     result = test_session(session_code, review_section=class_section)
     if not isinstance(result, tuple):
         raise ValueError('Classtime access failed at ' + str(result.get('stage', result.get('status', 'login'))) + '. No bypass attempted.')
@@ -88,9 +85,8 @@ def load_review(session_code, class_section):
     from classtime_review import attach_archive_reports
     from pathlib import Path
     try:
-        from browser_runtime import browser_slot
-        with browser_slot():
-            return attach_archive_reports(review, Path(archive_path))
+        from browser_runtime import run_browser
+        return run_browser(attach_archive_reports, review, Path(archive_path))
     finally:
         import shutil
         shutil.rmtree(str(Path(archive_path).parent), ignore_errors=True)

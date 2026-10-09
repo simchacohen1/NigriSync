@@ -48,7 +48,12 @@ class RuntimeTests(unittest.TestCase):
         with zipfile.ZipFile(archive, 'w') as output:
             output.writestr('review.json', json.dumps(metadata))
             output.writestr('../../untrusted-name.pdf', report.getvalue())
-        result, pdfs = import_review_archive(archive.getvalue())
+        import tempfile
+        with tempfile.TemporaryDirectory() as folder:
+            archive_path = Path(folder) / 'review.zip'
+            archive_path.write_bytes(archive.getvalue())
+            with patch('browser_runtime.memory_usage', return_value=(0, 0)):
+                result, pdfs = run_browser(import_review_archive, archive_path)
         self.assertEqual(len(pdfs), 1)
         self.assertTrue(all(isinstance(p, str) and Path(p).is_file() for p in pdfs.values()))
         import app

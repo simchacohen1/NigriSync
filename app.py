@@ -127,9 +127,8 @@ def classtime_import_review():
             with path.open('wb') as output:
                 import shutil
                 shutil.copyfileobj(request.stream, output, length=65536)
-            from browser_runtime import browser_slot
-            with browser_slot():
-                result, pdfs = import_review_archive(path)
+            from browser_runtime import run_browser
+            result, pdfs = run_browser(import_review_archive, path)
         key = store_review(owner, result, pdfs)
         response = jsonify({"review_id": key, "result": result, "read_only": True, "sync_enabled": False})
         response.headers["Cache-Control"] = "no-store"
