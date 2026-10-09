@@ -13,6 +13,8 @@ def _chromium_args():
         '--disable-gpu', '--disable-software-rasterizer',
         '--disable-extensions', '--disable-background-networking', '--disable-component-update',
         '--disable-sync', '--disable-default-apps', '--mute-audio', '--no-first-run',
+        '--disable-breakpad', '--disable-domain-reliability', '--disable-client-side-phishing-detection',
+        '--disable-features=Translate,OptimizationHints,MediaRouter',
         '--js-flags=--max-old-space-size=96',
     ]
     # Single-process Chromium saves a lot of RAM but is not officially supported.
@@ -21,6 +23,53 @@ def _chromium_args():
     if os.environ.get('CLASSTIME_CHROMIUM_SINGLE_PROCESS', '1') != '0':
         args = ['--single-process', '--no-zygote'] + args
     return args
+
+
+# Never needed to log in, read grades or export reports. Types the page never has to load:
+_BLOCKED_TYPES = ('image', 'media', 'font', 'texttrack', 'manifest', 'ping', 'cspviolationreport')
+# Analytics, ads, session-replay and chat widgets only. Classtime's own domains and
+# Google reCAPTCHA are deliberately NOT listed. Turn off with CLASSTIME_BLOCK_TRACKERS=0.
+_TRACKER_DOMAINS = (
+    'google-analytics.com', 'googletagmanager.com', 'doubleclick.net', 'googlesyndication.com', 'googleadservices.com',
+    'facebook.net', 'hotjar.com', 'hotjar.io', 'intercom.io', 'intercomcdn.com', 'segment.io', 'segment.com',
+    'sentry.io', 'fullstory.com', 'clarity.ms', 'hubspot.com', 'hs-scripts.com', 'hs-analytics.net', 'mixpanel.com',
+    'amplitude.com', 'heapanalytics.com', 'crisp.chat', 'drift.com', 'zendesk.com', 'zdassets.com', 'linkedin.com',
+    'licdn.com', 'ads-twitter.com', 'tiktok.com', 'posthog.com', 'newrelic.com', 'nr-data.net', 'smartlook.com',
+    'logrocket.com', 'lr-ingest.io', 'youtube.com', 'vimeo.com', 'wistia.com',
+)
+
+
+def _host_matches(host, domains):
+    return any(host == d or host.endswith('.' + d) for d in domains)
+
+
+def _make_router(stats):
+    """Request filter that also records host NAMES only (never URLs, paths or tokens)."""
+    block_trackers = os.environ.get('CLASSTIME_BLOCK_TRACKERS', '1') != '0'
+    def handle(route):
+        request = route.request
+        if request.resource_type in _BLOCKED_TYPES:
+            stats['blocked_types'] += 1
+            return route.abort()
+        try:
+            from urllib.parse import urlparse
+            host = (urlparse(request.url).hostname or '').lower()
+        except ValueError:
+            host = ''
+        if block_trackers and host and _host_matches(host, _TRACKER_DOMAINS):
+            stats['blocked_trackers'] += 1
+            if len(stats['blocked_hosts']) < 40: stats['blocked_hosts'].add(host)
+            return route.abort()
+        if host and not _host_matches(host, ('classtime.com',)) and len(stats['hosts']) < 40:
+            stats['hosts'].add(host)
+        return route.continue_()
+    return handle
+
+
+def _log_network(stats):
+    print('Classtime network: blocked ' + str(stats['blocked_types']) + ' image/font/media requests and '
+          + str(stats['blocked_trackers']) + ' tracker requests (' + ', '.join(sorted(stats['blocked_hosts'])) + '); '
+          'other outside hosts contacted: ' + ', '.join(sorted(stats['hosts'])), flush=True)
 
 
 def test_session(session_code, inspect_exports=False, review_section=None):
@@ -49,8 +98,8 @@ def _test_session(session_code, inspect_exports=False, review_section=None):
         browser = p.chromium.launch(headless=True, args=_chromium_args())
         log_memory('chromium launched')
         context = browser.new_context()
-        # Images, media and fonts are never needed to read grades or export reports.
-        context.route('**/*', lambda route: route.abort() if route.request.resource_type in ('image', 'media', 'font') else route.continue_())
+        stats = dict(blocked_types=0, blocked_trackers=0, blocked_hosts=set(), hosts=set())
+        context.route('**/*', _make_router(stats))
         page = context.new_page()
         page.set_default_timeout(15000)
         log_memory('page ready')
@@ -77,6 +126,7 @@ def _test_session(session_code, inspect_exports=False, review_section=None):
             page.wait_for_function("""(code) => { const t = document.body.innerText; return t.includes(code) || t.includes('Shorashim') || /session not found|do not have access|permission denied/i.test(t); }""", arg=session_code, timeout=90000)
             page.wait_for_timeout(3000)
             log_memory('session page rendered')
+            _log_network(stats)
             if blocked(page):
                 return {'status': 'blocked', 'stage': stage, 'nigri_writes': False}
             if review_section:
