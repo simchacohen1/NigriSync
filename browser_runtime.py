@@ -7,6 +7,7 @@ from pathlib import Path
 import signal
 import time
 
+STARTED_AT = time.time()
 LOCK_PATH = '/tmp/nigrisync-browser.lock'
 
 @contextlib.contextmanager
@@ -24,7 +25,7 @@ def memory_usage():
                               ('/sys/fs/cgroup/memory/memory.usage_in_bytes','/sys/fs/cgroup/memory/memory.limit_in_bytes')]:
         try:
             limit = int(Path(maximum).read_text())
-            return int(Path(current).read_text()), limit
+            return int(Path(current).read_text()), min(limit, 512 * 1024 * 1024)
         except (OSError, ValueError): pass
     return 0, 0
 
@@ -50,6 +51,9 @@ def _stop(process):
 
 def run_browser(target, *args, **kwargs):
     with browser_slot():
+        used, limit = memory_usage()
+        if os.environ.get('RENDER') and not limit:
+            raise ValueError('Classtime retrieval is disabled because the service memory limit cannot be monitored safely.')
         context = multiprocessing.get_context('spawn')
         receive, send = context.Pipe(duplex=False)
         process = context.Process(target=_worker, args=(send, target, args, kwargs))
@@ -72,3 +76,16 @@ def run_browser(target, *args, **kwargs):
         finally:
             receive.close(); _stop(process)
             print('Classtime browser cleanup complete; peak service memory MiB=' + str(round(peak / 1024 / 1024, 1)), flush=True)
+
+
+def resource_status():
+    used, limit = memory_usage()
+    browsers = 0
+    for path in Path('/proc').glob('[0-9]*/status'):
+        try:
+            text = path.read_text()
+            name = text.splitlines()[0].lower()
+            if ('chrome' in name or 'chromium' in name) and '\nState:\tZ' not in text: browsers += 1
+        except OSError: pass
+    return dict(memory_mib=round(used / 1024**2, 1), memory_limit_mib=round(limit / 1024**2, 1),
+                running_browser_processes=browsers, instance_started_at=STARTED_AT)

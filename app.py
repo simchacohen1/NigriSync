@@ -57,6 +57,16 @@ SYNC_API_KEY = os.environ.get("SYNC_API_KEY")
 
 
 # Read-only Classtime diagnostic, separate from every Nigri write route.
+@app.route("/classtime/resources", methods=["GET"])
+def classtime_resource_status():
+    from classtime_auth import review_owner
+    from browser_runtime import resource_status
+    if not review_owner(): return jsonify({"error": "unauthorized"}), 401
+    response = jsonify(resource_status())
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 @app.route("/classtime/test-session", methods=["POST"])
 def classtime_test_session():
     import hmac

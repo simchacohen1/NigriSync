@@ -24,8 +24,10 @@ def _test_session(session_code, inspect_exports=False, review_section=None):
     def blocked(page):
         text = page.locator('body').inner_text().lower()
         return any(s in text for s in ('verify you are human', 'checking your browser', 'unusual traffic', 'automated traffic', 'access denied')) or page.locator('iframe[src*="recaptcha"], iframe[src*="hcaptcha"], iframe[src*="challenges.cloudflare"]').count() > 0
+    # Limit the Playwright Node driver independently of the Chromium V8 heap.
+    os.environ['NODE_OPTIONS'] = '--max-old-space-size=64'
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=['--single-process', '--no-zygote'])
+        browser = p.chromium.launch(headless=True, args=['--single-process', '--no-zygote', '--js-flags=--max-old-space-size=96'])
         context = browser.new_context()
         context.route('**/*', lambda route: route.abort() if route.request.resource_type in ('image', 'media', 'font') else route.continue_())
         page = context.new_page()
