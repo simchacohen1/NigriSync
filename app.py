@@ -29,7 +29,10 @@ from nigri_playwright import (
 from attendance_reader import read_attendance
 
 app = Flask(__name__)
-CORS(app)  # allow calls from simchacohen1.github.io
+CORS(app, resources={
+    r"/classtime/.*": {"origins": ["https://simchacohen1.github.io", "https://funtorahtools.com", "https://www.funtorahtools.com", "https://funtorahtools.org", "https://www.funtorahtools.org"]},
+    r"/(?!classtime/).*": {"origins": "*"},  # Preserve existing Attendance/Weekly Quiz behavior.
+})
 
 SYNC_API_KEY = os.environ.get("SYNC_API_KEY")
 
@@ -50,6 +53,59 @@ def classtime_test_session():
         return jsonify({"error": "A six-character session code is required"}), 400
     response = jsonify(test_session(code, inspect_exports=body.get("inspect_exports") is True))
     response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.route("/classtime/reviews", methods=["POST"])
+def classtime_create_review():
+    from classtime_auth import review_owner
+    from classtime_review import start_review
+    owner = review_owner()
+    if not owner: return jsonify({"error": "unauthorized"}), 401
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict): return jsonify({"error": "Invalid request"}), 400
+    import re
+    code = str(body.get("session_code", "")).strip().upper()
+    section = body.get("class_section")
+    if not re.fullmatch(r"[A-Z0-9]{6}", code) or section not in ("B3 ET", "B3 WT"):
+        return jsonify({"error": "Choose B3 ET or B3 WT and a six-character session code"}), 400
+    try:
+        from classtime_reader import load_review
+        key = start_review(owner, code, section, load_review)
+        response = jsonify({"review_id": key, "read_only": True, "sync_enabled": False})
+        response.headers["Cache-Control"] = "no-store"
+        return response, 202
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 409
+
+
+@app.route("/classtime/reviews/<review_id>", methods=["GET"])
+def classtime_get_review(review_id):
+    from classtime_auth import review_owner
+    from classtime_review import get_review
+    owner = review_owner()
+    if not owner: return jsonify({"error": "unauthorized"}), 401
+    job = get_review(review_id, owner)
+    if not job: return jsonify({"error": "Review expired or unavailable. Load it again."}), 404
+    response = jsonify({"status": job["status"], "detail": job.get("detail"), "result": job.get("result")})
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.route("/classtime/reviews/<review_id>/pdfs/<pdf_id>", methods=["GET"])
+def classtime_review_pdf(review_id, pdf_id):
+    from classtime_auth import review_owner
+    from classtime_review import get_review
+    from flask import Response
+    owner = review_owner()
+    if not owner: return jsonify({"error": "unauthorized"}), 401
+    job = get_review(review_id, owner)
+    report = job and job["pdfs"].get(pdf_id)
+    if not report: return jsonify({"error": "PDF expired or unavailable"}), 404
+    response = Response(report, mimetype="application/pdf")
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Content-Disposition"] = 'inline; filename="student-report.pdf"'
     return response
 
 

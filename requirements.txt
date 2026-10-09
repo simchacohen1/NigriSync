@@ -2,3 +2,8 @@ flask
 flask-cors
 playwright
 gunicorn
+
+pypdf
+google-auth
+requests
+cryptography
