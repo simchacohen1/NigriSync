@@ -48,7 +48,7 @@ def classtime_test_session():
     import re
     if not re.fullmatch(r"[A-Z0-9]{6}", code):
         return jsonify({"error": "A six-character session code is required"}), 400
-    response = jsonify(test_session(code))
+    response = jsonify(test_session(code, inspect_exports=body.get("inspect_exports") is True))
     response.headers["Cache-Control"] = "no-store"
     return response
 
