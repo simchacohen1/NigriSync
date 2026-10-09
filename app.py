@@ -34,6 +34,25 @@ CORS(app)  # allow calls from simchacohen1.github.io
 SYNC_API_KEY = os.environ.get("SYNC_API_KEY")
 
 
+# Read-only Classtime diagnostic, separate from every Nigri write route.
+@app.route("/classtime/test-session", methods=["POST"])
+def classtime_test_session():
+    import hmac
+    from classtime_reader import test_session
+    expected = os.environ.get("CLASSTIME_TEST_TOKEN", "")
+    supplied = request.headers.get("Authorization", "")
+    if not expected or not hmac.compare_digest(supplied, "Bearer " + expected):
+        return jsonify({"error": "unauthorized"}), 401
+    body = request.get_json(silent=True) or {}
+    code = str(body.get("session_code", "")).strip().upper()
+    import re
+    if not re.fullmatch(r"[A-Z0-9]{6}", code):
+        return jsonify({"error": "A six-character session code is required"}), 400
+    response = jsonify(test_session(code))
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"})
