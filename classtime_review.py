@@ -6,7 +6,6 @@ import uuid
 import threading
 import hashlib
 import unicodedata
-from pypdf import PdfReader
 from nigri_playwright import REWARDS_CHILD_IDS, _MARKS_CLASS_STUDENTS
 
 ALIASES = {
@@ -61,6 +60,7 @@ def parse_session(rows, text, code, section):
 def verify_pdf(data, students):
     if len(data) > 8 * 1024 * 1024 or not data.startswith(b'%PDF-'):
         raise ValueError('Invalid or oversized PDF')
+    from pypdf import PdfReader
     pdf = PdfReader(io.BytesIO(data))
     if pdf.is_encrypted or not 0 < len(pdf.pages) <= 100:
         raise ValueError('PDF cannot be verified')

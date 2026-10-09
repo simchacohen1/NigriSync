@@ -20,7 +20,7 @@ def test_session(session_code, inspect_exports=False, review_section=None):
         text = page.locator('body').inner_text().lower()
         return any(s in text for s in ('verify you are human', 'checking your browser', 'unusual traffic', 'automated traffic', 'access denied')) or page.locator('iframe[src*="recaptcha"], iframe[src*="hcaptcha"], iframe[src*="challenges.cloudflare"]').count() > 0
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(headless=True, args=["--disable-gpu", "--disable-software-rasterizer", "--renderer-process-limit=1"])
         context = browser.new_context()
         context.route('**/*', lambda route: route.abort() if route.request.resource_type in ('image', 'media', 'font') else route.continue_())
         page = context.new_page()
@@ -31,6 +31,7 @@ def test_session(session_code, inspect_exports=False, review_section=None):
             if blocked(page):
                 return {'status': 'blocked', 'stage': stage, 'detail': 'Human verification or access restriction; no bypass attempted', 'nigri_writes': False}
             stage = 'logging_in'
+            if review_section: print('Classtime review: logging in', flush=True)
             page.get_by_role('textbox', name='Email', exact=True).fill(email)
             page.get_by_label('Password', exact=True).fill(password)
             page.get_by_role('button', name='Log in', exact=True).click()
@@ -39,6 +40,7 @@ def test_session(session_code, inspect_exports=False, review_section=None):
             except BrowserTimeout:
                 return {'status': 'blocked' if blocked(page) else 'login_failed', 'stage': stage, 'detail': 'Login did not reach an authenticated page. No retry or bypass attempted.', 'nigri_writes': False}
             stage = 'reading_session'
+            if review_section: print('Classtime review: reading session', flush=True)
             page.goto('https://www.classtime.com/sessions/' + session_code, wait_until='domcontentloaded', timeout=45000)
             # Wait for the SPA to render a session heading or its access error.
             page.wait_for_function("""(code) => { const t = document.body.innerText; return t.includes(code) || t.includes('Shorashim') || /session not found|do not have access|permission denied/i.test(t); }""", arg=session_code, timeout=45000)
@@ -67,10 +69,27 @@ def test_session(session_code, inspect_exports=False, review_section=None):
 
 
 def load_review(session_code, class_section):
+    from classtime_review import verify_pdf
+    import uuid
+    import hashlib
     result = test_session(session_code, review_section=class_section)
     if not isinstance(result, tuple):
         raise ValueError('Classtime access failed at ' + str(result.get('stage', result.get('status', 'login'))) + '. No bypass attempted.')
-    return result
+    review, raw_reports = result
+    # Chromium has closed before PDF parsing, reducing peak memory on Render.
+    pdfs = {}
+    for filename, data in raw_reports:
+        try:
+            student, pdf_text = verify_pdf(data, review['students'])
+        except ValueError:
+            raise ValueError('A PDF could not be uniquely matched by its contents. No PDF was assigned by filename.') from None
+        if student['pdf_status'] == 'verified': raise ValueError('Two reports claim the same student identity')
+        pdf_id = uuid.uuid4().hex
+        student.update(pdf_status='verified', pdf_id=pdf_id, pdf_filename=filename, pdf_sha256=hashlib.sha256(data).hexdigest(), pdf_identity=student['classtime_name'])
+        pdfs[pdf_id] = data
+    for student in review['students']:
+        if student['pdf_status'] != 'verified': student.update(pdf_status='missing', pdf_detail='Classtime did not include a report for this student')
+    return review, pdfs
 
 
 def _export_controls(page):
@@ -88,10 +107,11 @@ def _collect_review(page, code, section):
     import hashlib
     from datetime import datetime, timezone
     from pathlib import Path
-    from classtime_review import parse_session, verify_pdf
+    from classtime_review import parse_session
     text = page.locator('body').inner_text()
     rows = page.locator('tr, [role="row"]').all_inner_texts()
     result = parse_session(rows, text, code, section)
+    print("Classtime review: opening export", flush=True)
     page.locator('[aria-label="Export"] button').click()
     page.wait_for_timeout(1000)
     student_report = page.get_by_text(re.compile(r'^Student Reports?(?:\s*\(PDF\))?$', re.I))
@@ -101,6 +121,7 @@ def _collect_review(page, code, section):
     archive = page.get_by_text(re.compile(r'^Export all(?:\s*\(as \.zip\))?$', re.I))
     if archive.count() != 1:
         raise ValueError('Student ZIP export control was not identified. Visible export choices: ' + _export_controls(page))
+    print("Classtime review: downloading ZIP", flush=True)
     with page.expect_download(timeout=150000) as download_info:
         archive.click()
     download = download_info.value
@@ -108,25 +129,14 @@ def _collect_review(page, code, section):
         target = Path(folder) / 'reports.zip'
         download.save_as(str(target))
         if target.stat().st_size > 40 * 1024 * 1024: raise ValueError('Report archive exceeds the size limit')
-        pdfs = {}
+        raw_reports = []
         with zipfile.ZipFile(target) as archive_file:
             entries = [entry for entry in archive_file.infolist() if not entry.is_dir() and entry.filename.lower().endswith('.pdf')]
             if len(entries) > 100 or sum(entry.file_size for entry in entries) > 40 * 1024 * 1024:
                 raise ValueError('Report archive exceeds the verification limits')
             for entry in entries:
                 if entry.file_size > 8 * 1024 * 1024: raise ValueError('Individual report is too large')
-                data = archive_file.read(entry)
-                try:
-                    student, pdf_text = verify_pdf(data, result['students'])
-                except ValueError:
-                    raise ValueError('A PDF could not be uniquely matched by its contents. No PDF was assigned by filename.') from None
-                if student['pdf_status'] == 'verified': raise ValueError('Two reports claim the same student identity')
-                pdf_id = uuid.uuid4().hex
-                student.update(pdf_status='verified', pdf_id=pdf_id, pdf_filename=Path(entry.filename).name, pdf_sha256=hashlib.sha256(data).hexdigest(), pdf_identity=student['classtime_name'])
-                pdfs[pdf_id] = data
-        for student in result['students']:
-            if student['pdf_status'] != 'verified':
-                student.update(pdf_status='missing', pdf_detail='Classtime did not include a report for this student')
+                raw_reports.append((Path(entry.filename).name, archive_file.read(entry)))
         result['retrieved_at'] = datetime.now(timezone.utc).isoformat()
         result['archive_report_count'] = len(entries)
-        return result, pdfs
+        return result, raw_reports
