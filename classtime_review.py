@@ -57,7 +57,7 @@ def parse_session(rows, text, code, section):
     if not students: raise ValueError('No student score rows were found')
     return {'session_code': code, 'session_name': title.group(1), 'class_section': section, 'students': students, 'read_only': True, 'sync_enabled': False, 'nigri_writes': False}
 
-def verify_pdf(data, students):
+def verify_pdf(data, students, session_code=None, class_section=None):
     if len(data) > 8 * 1024 * 1024 or not data.startswith(b'%PDF-'):
         raise ValueError('Invalid or oversized PDF')
     from pypdf import PdfReader
@@ -70,7 +70,16 @@ def verify_pdf(data, students):
     matches = [s for s in students if ' ' + normalize(s['classtime_name']) + ' ' in normalized]
     if len(matches) != 1:
         raise ValueError('PDF student identity is missing or ambiguous')
-    return matches[0], text
+    student = matches[0]
+    if session_code and not re.search(r'Session:\s*' + re.escape(session_code) + r'\b', text):
+        raise ValueError('PDF identifies a different session')
+    if class_section and not re.search(r'Class:\s*' + re.escape(class_section) + r'\b', text):
+        raise ValueError('PDF identifies a different class')
+    if session_code:
+        score = re.search(r'(\d+(?:\.\d+)?)\s*/\s*(\d+(?:\.\d+)?)\s*points\b', text)
+        if not score or student['points'] is None or float(score.group(1)) != student['points'] or float(score.group(2)) != student['maximum_points']:
+            raise ValueError('PDF score does not match the reviewed grade')
+    return student, text
 
 JOBS = {}
 LOCK = threading.Lock()

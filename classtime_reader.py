@@ -80,7 +80,7 @@ def load_review(session_code, class_section):
     pdfs = {}
     for filename, data in raw_reports:
         try:
-            student, pdf_text = verify_pdf(data, review['students'])
+            student, pdf_text = verify_pdf(data, review['students'], session_code, class_section)
         except ValueError:
             raise ValueError('A PDF could not be uniquely matched by its contents. No PDF was assigned by filename.') from None
         if student['pdf_status'] == 'verified': raise ValueError('Two reports claim the same student identity')
@@ -88,7 +88,10 @@ def load_review(session_code, class_section):
         student.update(pdf_status='verified', pdf_id=pdf_id, pdf_filename=filename, pdf_sha256=hashlib.sha256(data).hexdigest(), pdf_identity=student['classtime_name'])
         pdfs[pdf_id] = data
     for student in review['students']:
-        if student['pdf_status'] != 'verified': student.update(pdf_status='missing', pdf_detail='Classtime did not include a report for this student')
+        if student['pdf_status'] != 'verified':
+            offered = review.get('pdf_export_offered_names')
+            detail = 'Classtime did not offer a PDF for this student in its export list' if offered is not None and student['classtime_name'] not in offered else 'Classtime did not include a report for this student'
+            student.update(pdf_status='missing', pdf_detail=detail)
     return review, pdfs
 
 
@@ -121,6 +124,11 @@ def _collect_review(page, code, section):
     archive = page.get_by_text(re.compile(r'^Export all(?:\s*\(as \.zip\))?$', re.I))
     if archive.count() != 1:
         raise ValueError('Student ZIP export control was not identified. Visible export choices: ' + _export_controls(page))
+    dialogs = page.locator('[role="dialog"]')
+    if dialogs.count():
+        picker_text = dialogs.last.inner_text()
+        result['pdf_export_offered_names'] = [student['classtime_name'] for student in result['students'] if student['classtime_name'] in picker_text]
+        result['pdf_export_observation'] = picker_text[:5000]
     print("Classtime review: downloading ZIP", flush=True)
     with page.expect_download(timeout=150000) as download_info:
         archive.click()
