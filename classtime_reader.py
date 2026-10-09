@@ -22,6 +22,7 @@ def test_session(session_code, inspect_exports=False):
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context()
+        context.route('**/*', lambda route: route.abort() if route.request.resource_type in ('image', 'media', 'font') else route.continue_())
         page = context.new_page()
         page.set_default_timeout(15000)
         try:
@@ -37,6 +38,14 @@ def test_session(session_code, inspect_exports=False):
                 page.wait_for_url(lambda url: '/auth/' not in url, timeout=30000)
             except BrowserTimeout:
                 return {'status': 'blocked' if blocked(page) else 'login_failed', 'stage': stage, 'detail': 'Login did not reach an authenticated page. No retry or bypass attempted.', 'nigri_writes': False}
+            if inspect_exports:
+                page.close()
+                page = context.new_page()
+                page.set_default_timeout(15000)
+                page.goto('https://www.classtime.com/sessions', wait_until='domcontentloaded', timeout=45000)
+                page.get_by_text(session_code, exact=False).first.wait_for(timeout=45000)
+                page.wait_for_timeout(2000)
+                return {'status': 'export_inspection', 'visible_text': clean(page.locator('body').inner_text())[:24000], 'controls': page.locator('button, a, [role=button]').evaluate_all('(els) => els.map(e => ({text:e.innerText, label:e.getAttribute("aria-label"), title:e.getAttribute("title"), href:e.getAttribute("href")}))'), 'nigri_writes': False}
             stage = 'reading_session'
             page.goto('https://www.classtime.com/sessions/' + session_code, wait_until='domcontentloaded', timeout=45000)
             # Wait for the SPA to render a session heading or its access error.
@@ -44,11 +53,6 @@ def test_session(session_code, inspect_exports=False):
             page.wait_for_timeout(3000)
             if blocked(page):
                 return {'status': 'blocked', 'stage': stage, 'nigri_writes': False}
-            if inspect_exports:
-                page.goto('https://www.classtime.com/sessions', wait_until='domcontentloaded', timeout=45000)
-                page.get_by_text(session_code, exact=False).first.wait_for(timeout=45000)
-                page.wait_for_timeout(2000)
-                return {'status': 'export_inspection', 'visible_text': clean(page.locator('body').inner_text())[:24000], 'controls': page.locator('button, a, [role=button]').evaluate_all('(els) => els.map(e => ({text:e.innerText, label:e.getAttribute("aria-label"), title:e.getAttribute("title")}))'), 'nigri_writes': False}
             text = clean(page.locator('body').inner_text())
             rows = page.locator('tr, [role="row"]').all_inner_texts()
             return {'status': 'login_succeeded' if '/auth/' not in page.url else 'session_access_denied', 'session_code': session_code, 'stage': stage, 'page_title': clean(page.title()), 'visible_text': text[:24000], 'visible_rows': [clean(row) for row in rows][:200], 'nigri_writes': False, 'note': 'Diagnostic observations only; names and grades require verification before integration.'}
