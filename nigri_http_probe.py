@@ -161,3 +161,79 @@ def probe():
                 **diagnostics, 'http_login_succeeded': recognizable, 'create_link_found': bool(create),
                 'create_link_kind': kind, 'create_link_query_keys': keys,
                 'form_count': len(marks.forms), 'nigri_writes': False}
+
+
+
+def probe_hybrid():
+    """Read-only login through Chromium, then CLOSE it and GET marks over HTTP.
+
+    No Create Mark!, Save!, upload or delete requests. Cookies stay in memory
+    only; returned results contain no credentials, cookie details or student data.
+    """
+    from browser_runtime import log_memory
+    from classtime_reader import _chromium_args
+    from nigri_playwright import login
+    from playwright.sync_api import sync_playwright
+
+    if not os.environ.get('NIGRI_USERNAME') or not os.environ.get('NIGRI_PASSWORD'):
+        return {'status': 'credentials_missing', 'nigri_writes': False}
+
+    stage = 'starting_browser'
+    browser_cookies = []
+    user_agent = None
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=_chromium_args())
+            log_memory('hybrid: chromium launched')
+            try:
+                context = browser.new_context()
+                page = context.new_page()
+                stage = 'browser_signin'
+                login(page)  # Uses the existing proven browser sign-in.
+                log_memory('hybrid: browser sign-in completed')
+                browser_cookies = [
+                    x for x in context.cookies()
+                    if x.get('name') and x.get('value')
+                    and (x.get('domain', '').lstrip('.').lower() == HOST
+                         or x.get('domain', '').lstrip('.').lower() == 'nigrijewishonlineschool.com')
+                ]
+                user_agent = page.evaluate('navigator.userAgent')
+            finally:
+                browser.close()
+                log_memory('hybrid: chromium closed before HTTP')
+        stage = 'http_marks'
+        log_memory('hybrid: playwright driver closed')
+        with requests.Session() as session:
+            session.headers['User-Agent'] = user_agent or 'Mozilla/5.0'
+            for ck in browser_cookies:
+                session.cookies.set(
+                    ck['name'], ck['value'], domain=ck['domain'],
+                    path=ck.get('path') or '/', secure=ck.get('secure', True),
+                )
+            cookies_would_send = bool(
+                session.prepare_request(requests.Request('GET', MARKS_URL)).headers.get('Cookie')
+            )
+            response = _request(session, 'GET', MARKS_URL)  # Strictly read only.
+            marks = _page(response)
+            form_names = {i['name'] for f in marks.forms for i in f['inputs']}
+            has_marks = bool(
+                marks.has_create_text
+                or any('create new mark' in x['label'].lower() for x in marks.links)
+                or {'testGradeID', 'testName', 'testDate'} & form_names
+            )
+            has_login_form = any(
+                {'login', 'password'}.issubset({i['name'] for i in f['inputs']})
+                for f in marks.forms
+            )
+            return {
+                'status': 'hybrid_marks_found' if has_marks else 'hybrid_marks_unconfirmed',
+                'marks_controls_found': has_marks,
+                'login_form_on_marks': has_login_form,
+                'browser_closed_before_http': True,
+                'transferred_cookie_count': len(browser_cookies),
+                'cookies_sent_to_marks': cookies_would_send,
+                'nigri_writes': False,
+            }
+    except Exception:
+        # Never return exception text (could include sensitive URLs/cookies).
+        return {'status': 'hybrid_' + stage + '_stopped', 'nigri_writes': False}
