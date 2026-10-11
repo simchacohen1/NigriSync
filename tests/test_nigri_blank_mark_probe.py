@@ -191,6 +191,93 @@ class BlankMarkProbeTests(unittest.TestCase):
                 self.assertFalse(rehearsal['real_post_acceptance_verified'])
                 self.assertEqual(len(session.calls), 1)
 
+    def test_readonly_hidden_categories_and_grade_topic_options(self):
+        html = (
+            '<form method="post" action="/main/default_os_prog.asp">'
+            '<select name="testGradeID">'
+            '<option value="">Select</option>'
+            '<option value="22590">Fictional Grade</option>'
+            '<option value="22453">Fictional Grade Two</option>'
+            '<option value="SENSITIVE_OTHER_GRADE">SENSITIVE_NAME</option>'
+            '</select>'
+            '<select name="testTopicID">'
+            '<option value="">Choose topic</option>'
+            '<option value="142">Shoroshim</option>'
+            '<option value="PRIVATE_STUDENT_TOKEN">PRIVATE_LABEL</option>'
+            '</select>'
+            '<input type="radio" name="testType" id="testType_quiz" value="quiz">'
+            '<input name="testName"><input name="testDate"><textarea name="testDesc"></textarea>'
+            '<input type="hidden" name="privateSessionKey" value="ULTRA_SECRET">'
+            '<input type="hidden" name="testID" value="0">'
+            '<input type="hidden" name="spareToken" value="">'
+            '<input type="submit" value="Create Mark!">'
+            '</form>'
+        )
+        result, session = self.run_probe(html=html)
+        details = result['readonly_form_dependencies']
+        self.assertEqual(details['status'], 'form_controls_observed')
+        self.assertTrue(details['b3_et_option_present'])
+        self.assertTrue(details['b3_wt_option_present'])
+        self.assertTrue(details['shoroshim_topic_option_initially_present'])
+        self.assertTrue(details['quiz_type_radio_present'])
+        self.assertEqual(details['hidden_input_count'], 3)
+        self.assertEqual(details['hidden_blank_count'], 1)
+        self.assertEqual(details['hidden_zero_count'], 1)
+        self.assertEqual(details['hidden_nonblank_redacted_count'], 1)
+        self.assertFalse(details['topic_after_grade_selection_verified'])
+        self.assertFalse(details['hidden_field_required_for_post_verified'])
+        self.assertTrue(details['no_grade_selected'])
+        self.assertTrue(details['no_ajax_called'])
+        self.assertTrue(details['no_submit_performed'])
+        self.assertTrue(details['read_only'])
+        for secret in ('ULTRA_SECRET', 'privateSessionKey',
+                       'SENSITIVE_OTHER_GRADE', 'SENSITIVE_NAME',
+                       'PRIVATE_STUDENT_TOKEN', 'PRIVATE_LABEL', 'spareToken'):
+            self.assertNotIn(secret, str(result))
+        self.assertEqual(len(session.calls), 1)
+        self.assertEqual(session.calls[0][0], 'GET')
+        self.assertFalse(result['nigri_writes'])
+
+    def test_absent_initial_topic_is_not_reported_as_ajax_failure(self):
+        result, session = self.run_probe(html=(
+            '<form method="post" action="/main/default_os_prog.asp">'
+            '<select name="testGradeID"><option value="22590">B3 ET</option></select>'
+            '<select name="testTopicID"><option value="">Choose</option></select>'
+            '<input name="testName"><input name="testDate">'
+            '<input name="testType"><textarea name="testDesc"></textarea>'
+            '<input type="hidden" name="secret" value="SESSION_VALUE">'
+            '<input type="submit" value="Create Mark!">'
+            '</form>'
+        ))
+        details = result['readonly_form_dependencies']
+        self.assertTrue(details['b3_et_option_present'])
+        self.assertFalse(details['shoroshim_topic_option_initially_present'])
+        self.assertFalse(details['topic_after_grade_selection_verified'])
+        self.assertTrue(details['no_ajax_called'])
+        self.assertEqual(details['hidden_nonblank_redacted_count'], 1)
+        self.assertNotIn('SESSION_VALUE', str(details))
+        self.assertEqual([call[0] for call in session.calls], ['GET'])
+
+    def test_only_targeted_select_options_inspected(self):
+        result, session = self.run_probe(html=(
+            '<form method="post" action="/main/default_os_prog.asp">'
+            '<select name="studentRoster">'
+            '<option value="22590">REAL_STUDENT_NAME_HIDDEN</option>'
+            '</select>'
+            '<select name="testGradeID"><option value="22453">B3 WT</option></select>'
+            '<select name="testTopicID"><option value="137">Other topic</option></select>'
+            '<input name="testName">'
+            '<input type="submit" value="Create Mark!">'
+            '</form>'
+        ))
+        details = result['readonly_form_dependencies']
+        self.assertFalse(details['b3_et_option_present'])
+        self.assertTrue(details['b3_wt_option_present'])
+        self.assertFalse(details['shoroshim_topic_option_initially_present'])
+        self.assertTrue(details['read_only'])
+        self.assertEqual(len(session.calls), 1)
+        self.assertNotIn('REAL_STUDENT_NAME_HIDDEN', str(result))
+
     def test_redirect_is_never_followed(self):
         result, session = self.run_probe(status=302)
         self.assertEqual(result['status'], 'blank_form_get_not_200')
