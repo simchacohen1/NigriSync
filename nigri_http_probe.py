@@ -451,6 +451,58 @@ def _header_form_structure(page, fetched_url):
     }
 
 
+def _offline_header_packet_check(structure):
+    """Prepare a dummy header POST *in memory* using approved names only.
+
+    Uses a deliberately invalid mock domain, never the Nigri action URL.
+    Dynamic selectors/hidden token fields remain unknown. No transport,
+    real student information, credentials, cookies, or form values.
+    """
+    required_names = {'testGradeID', 'testTopicID', 'testName',
+                      'testDate', 'testDesc', 'testType'}
+    actual_names = set(structure.get('recognized_fields_in_form', []))
+    missing_names = sorted(required_names - actual_names)
+    result = {
+        'status': 'offline_header_shape_not_confirmed',
+        'all_six_expected_fields_present': not missing_names,
+        'missing_known_fields': missing_names,
+        'mock_request_prepared': False,
+        'mock_request_sent': False,
+        'nigri_post_attempted': False,
+        'real_post_acceptance_verified': False,
+        'topic_ajax_dependencies_unverified': True,
+        'hidden_controls_require_future_review':
+            bool(structure.get('hidden_input_count')),
+    }
+    if (structure.get('status') != 'header_form_structure_found'
+            or structure.get('method') != 'post'
+            or structure.get('action_kind') != 'same_host_teacher_asp'
+            or not structure.get('create_button_present')
+            or missing_names):
+        return result
+
+    from nigri_http_dry_run import _prepare_only
+    synthetic = {
+        'testGradeID': '990001', 'testTopicID': '990002',
+        'testName': 'FICTIONAL HEADER ONLY', 'testDate': '2026-10-11',
+        'testDesc': '', 'testType': 'quiz',
+    }
+    # Request.prepare() serializes locally; .send() is never called.
+    mock = _prepare_only('POST', '/mock/new-mark', data=synthetic)
+    body = mock.body
+    if (not isinstance(body, str) or
+            not mock.headers.get('Content-Type', '').startswith(
+                'application/x-www-form-urlencoded') or
+            not all(name + '=' in body for name in required_names)):
+        return result
+    result.update(
+        status='offline_header_shape_prepared',
+        mock_request_prepared=True,
+        mock_header_field_count=len(synthetic),
+    )
+    return result
+
+
 def _probe_blank_mark_form(session, marks):
     """One carefully validated GET, never a submit/POST. No redirects followed."""
     target, why = _safe_blank_mark_url(marks)
@@ -476,13 +528,16 @@ def _probe_blank_mark_form(session, marks):
     has_blank = {'testGradeID', 'testName'}.issubset(names)
     create_button = any(i['type'] in ('submit', 'image', 'button')
                         and i.get('value', '').strip() == 'Create Mark!' for i in inputs)
+    form_structure = _header_form_structure(page, target)
+    header_rehearsal = _offline_header_packet_check(form_structure)
     return {
         'status': 'blank_form_found' if has_blank else 'blank_form_unconfirmed',
         'form_detected': has_blank,
         'field_names': names[:30],
         'form_count': len(page.forms),
         'create_button_present': create_button,
-        'header_form_structure': _header_form_structure(page, target),
+        'header_form_structure': form_structure,
+        'offline_header_rehearsal': header_rehearsal,
         'only_one_extra_get': True,
         'no_submit_performed': True,
         'nigri_writes': False,
