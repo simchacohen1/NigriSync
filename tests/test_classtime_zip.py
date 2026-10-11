@@ -118,7 +118,7 @@ class ScoreCheckTests(ClassCheckTests):
             with contextlib.redirect_stdout(out):
                 with self.assertRaises(ValueError): attach_archive_reports(review, path)
         log = out.getvalue()
-        self.assertIn('1 of 2 PDFs failed', log); self.assertIn('points differ (within 1 point', log); self.assertIn('pdf_pattern=# / # points', log)
+        self.assertIn('1 of 2 PDFs failed', log); self.assertIn('points differ (within 1 point', log); self.assertIn('pdf_pattern=# / ## points', log)
         for secret in ('Sample', '7 / 12', '6.5', '9 / 12'): self.assertNotIn(secret, log)
     def test_dash_against_a_number_is_refused(self):
         import tempfile
