@@ -379,6 +379,78 @@ def _blank_mark_link_diagnostics(marks):
         return {'link_kind': 'other_host_or_invalid', 'no_navigation': True}
 
 
+def _header_form_structure(page, fetched_url):
+    """Only summarize the already-read blank form. NEVER submit or follow its action.
+
+    Strictly redact full action URL, query values, hidden values, student
+    information, cookie/token names and unexpected HTML field names.
+    """
+    required = {'testGradeID', 'testName'}
+    candidates = [
+        form for form in page.forms
+        if required.issubset({x.get('name') for x in form['inputs']})
+    ]
+    if len(candidates) != 1:
+        return {'status': 'header_form_missing_or_ambiguous',
+                'candidate_count': min(len(candidates), 10),
+                'form_not_submitted': True}
+    form = candidates[0]
+    method = form.get('method')
+    # HTML defaults to GET. It is not safe to infer POST if none is specified.
+    method_kind = method if method in ('get', 'post') else 'other'
+    raw_action = (form.get('action') or '').strip()
+    if not raw_action:
+        action_kind = 'current_blank_form_url'
+        action_query_keys = []
+        action_query_count = 0
+    elif raw_action.startswith('#') or raw_action.lower().startswith(('javascript:', 'data:')):
+        action_kind = 'script_or_fragment'
+        action_query_keys = []
+        action_query_count = 0
+    else:
+        try:
+            target = _safe_url(urljoin(fetched_url, raw_action))
+            parts = urlsplit(target)
+            action_kind = (
+                'same_host_teacher_asp' if parts.path.lower() == '/main/default_os_prog.asp'
+                else 'same_host_other_page'
+            )
+            pairs = parse_qsl(parts.query, keep_blank_values=True)
+            allowed = {'section', 'spec', 'subSection', 'side', 'submit',
+                       'testID', 'testGradeID', 'testTopicID'}
+            action_query_keys = sorted(set(key for key, _ in pairs if key in allowed))
+            action_query_count = min(len(pairs), 30)
+        except (ValueError, UnicodeError):
+            action_kind = 'external_or_untrusted'
+            action_query_keys = []
+            action_query_count = 0
+
+    recognized = {'testGradeID', 'testTopicID', 'testName',
+                  'testDate', 'testDesc', 'testType'}
+    names = {x.get('name') for x in form['inputs']}
+    submit_button = any(
+        x.get('type') in ('submit', 'image', 'button')
+        and x.get('value', '').strip() == 'Create Mark!'
+        for x in form['inputs']
+    )
+    return {
+        'status': 'header_form_structure_found',
+        'method': method_kind,
+        'action_kind': action_kind,
+        'action_recognized_query_keys': action_query_keys,
+        'action_query_parameter_count': action_query_count,
+        'recognized_fields_in_form': sorted(recognized & names),
+        'hidden_input_count': min(sum(x.get('type') == 'hidden'
+                                      for x in form['inputs']), 100),
+        'select_input_count': min(sum(x.get('type') == 'select'
+                                      for x in form['inputs']), 100),
+        'create_button_present': submit_button,
+        'form_not_submitted': True,
+        'real_post_endpoint_verified': False,
+        'real_post_result_verified': False,
+    }
+
+
 def _probe_blank_mark_form(session, marks):
     """One carefully validated GET, never a submit/POST. No redirects followed."""
     target, why = _safe_blank_mark_url(marks)
@@ -410,6 +482,7 @@ def _probe_blank_mark_form(session, marks):
         'field_names': names[:30],
         'form_count': len(page.forms),
         'create_button_present': create_button,
+        'header_form_structure': _header_form_structure(page, target),
         'only_one_extra_get': True,
         'no_submit_performed': True,
         'nigri_writes': False,
