@@ -166,7 +166,7 @@ def classtime_get_review(review_id):
 @app.route("/classtime/reviews/<review_id>/sync-preview", methods=["POST"])
 def classtime_sync_preview(review_id):
     """DRY RUN of 'Sync to Nigri'. Owner Google sign-in only (never the old key, never the diagnostic token).
-    Writes nothing to Nigri; its only Nigri contact is one read of the existing marks list."""
+    Writes nothing to Nigri and does not launch a browser or contact Nigri."""
     from classtime_auth import review_owner
     from classtime_review import get_review
     owner = review_owner(allow_diagnostic=False)
@@ -175,21 +175,13 @@ def classtime_sync_preview(review_id):
     if not job: return jsonify({"error": "Review expired or unavailable. Load it again."}), 404
     if job["status"] != "ready": return jsonify({"error": "The review is not ready yet"}), 409
     import classtime_sync
-    from nigri_playwright import MARKS_TOPIC_IDS, list_mark_titles
+    from nigri_playwright import MARKS_TOPIC_IDS
     try:
         options = classtime_sync.validate_options(request.get_json(silent=True), job["result"], MARKS_TOPIC_IDS)
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
-    titles, check_error = None, None
     try:
-        from browser_runtime import run_browser
-        titles = run_browser(list_mark_titles)
-    except ValueError as e:
-        check_error = str(e)
-    except Exception:
-        check_error = "Could not read the existing Nigri marks"
-    try:
-        response = jsonify(classtime_sync.preview(job["result"], job["pdfs"], options, titles, check_error))
+        response = jsonify(classtime_sync.preview(job["result"], job["pdfs"], options, None, duplicate_check_disabled=True))
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     response.headers["Cache-Control"] = "no-store"
@@ -206,7 +198,7 @@ def classtime_sync_save(review_id):
     import re
     import classtime_save as save
     import classtime_sync
-    from nigri_playwright import MARKS_TOPIC_IDS, list_mark_titles
+    from nigri_playwright import MARKS_TOPIC_IDS
     from browser_runtime import run_browser
     body = request.get_json(silent=True)
     job, refusal = save.claim(review_id, owner)   # the lock: a second click or a second save is refused here
@@ -224,21 +216,10 @@ def classtime_sync_save(review_id):
         if planned["hard_blockers"]:
             save.settle(review_id, "none")
             return respond({"saved": False, "error": "Not saved: " + "; ".join(planned["hard_blockers"]), "blockers": planned["hard_blockers"], "can_override": False}, 409)
-        # Read-only check: is this session already in Nigri?
-        status, detail = "could_not_check", None
-        try:
-            titles = run_browser(list_mark_titles)
-            if titles.get("titles"):
-                hits = classtime_sync.find_duplicates(titles["titles"], planned["options"], result["session_code"])
-                status = "duplicate" if hits else "clear"
-                detail = ('"' + hits[0] + '"') if hits else None
-            else:
-                detail = "the Nigri marks list showed no titled marks"
-        except ValueError as e:
-            detail = str(e)[:120]
-        except Exception:
-            detail = "could not read the existing Nigri marks"
-        if key in save.LEDGER and status == "clear":
+        # No Nigri duplicate lookup: it launched a second browser and could
+        # exhaust Render Free memory. Keep the existing in-process ledger.
+        status, detail = "clear", None
+        if key in save.LEDGER:
             status, detail = "duplicate", "saved earlier by this server (mark #" + str(save.LEDGER[key].get("test_id") or "?") + ")"
         blocked = save.check_override(body, planned["options"], status, detail, result["session_code"])
         if blocked:

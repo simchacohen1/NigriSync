@@ -92,10 +92,12 @@ def find_duplicates(existing_titles, options, code):
     return hits
 
 
-def preview(result, pdfs, options, mark_titles, check_error=None):
+def preview(result, pdfs, options, mark_titles, check_error=None, *, duplicate_check_disabled=False):
     """The full dry-run answer. `mark_titles` is the read-only list from Nigri, or None if it could not be read."""
     packet, rows, blockers = build_packet(result, pdfs, options)
-    if mark_titles is None:
+    if duplicate_check_disabled:
+        check = {'status': 'skipped', 'detail': 'Nigri duplicate lookup is disabled. Check Nigri yourself before saving the same session again.'}
+    elif mark_titles is None:
         check = {'status': 'could_not_check', 'detail': check_error or 'Could not read the existing Nigri marks'}
         blockers.append('Could not check whether this session is already saved; a real save would refuse')
     elif not mark_titles.get('titles'):
