@@ -153,6 +153,26 @@ def classtime_mock_save_simulation():
     return response
 
 
+# One-off owner-only B3 ET topic-refresh method discovery. Chromium first
+# signs in, then the class-change router ABORTS every outgoing request.
+# This cannot save a mark or fetch refreshed topics.
+@app.route("/classtime/nigri-topic-blocked-trace", methods=["POST"])
+def classtime_nigri_topic_blocked_trace():
+    from classtime_auth import review_owner
+    if not review_owner(allow_diagnostic=False):
+        return jsonify({"error": "unauthorized"}), 401
+    from browser_runtime import run_browser
+    from nigri_topic_trace import blocked_topic_refresh_trace
+    try:
+        result = run_browser(blocked_topic_refresh_trace, _time_limit=90)
+    except Exception:
+        result = {"status": "trace_stopped_by_memory_guard_or_timeout",
+                  "nigri_writes": False}
+    response = jsonify(result)
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 @app.route("/classtime/test-session", methods=["POST"])
 def classtime_test_session():
     import hmac
