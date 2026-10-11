@@ -212,13 +212,20 @@ def _mark_entry_readonly_summary(page):
     }
 
 
+def _hybrid_login_router(route):
+    """Skip Nigri login images/fonts/media only; preserve all functional requests."""
+    if route.request.resource_type in ('image', 'media', 'font', 'texttrack'):
+        return route.abort()
+    return route.continue_()
+
+
 def probe_hybrid():
     """Read-only login through Chromium, then CLOSE it and GET marks over HTTP.
 
     No Create Mark!, Save!, upload or delete requests. Cookies stay in memory
     only; returned results contain no credentials, cookie details or student data.
     """
-    from browser_runtime import log_memory
+    from browser_runtime import log_memory, memory_snapshot, MIB, STOP_PERCENT
     from classtime_reader import _chromium_args
     from nigri_playwright import login
     from playwright.sync_api import sync_playwright
@@ -231,10 +238,22 @@ def probe_hybrid():
     user_agent = None
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True, args=_chromium_args())
+            browser = p.chromium.launch(headless=True, args=_chromium_args() + [
+                '--disk-cache-size=0', '--media-cache-size=0',
+            ])
             log_memory('hybrid: chromium launched')
             try:
+                # The cold-start browser sometimes exceeds 350 MiB BEFORE any
+                # page loads. Abort early rather than letting login trigger
+                # Render's 430 MiB memory guard. Hybrid only; don't change
+                # Attendance, Weekly Quiz or Classtime retrieval.
+                snapshot = memory_snapshot()
+                if snapshot and snapshot['working_set'] + 105 * MIB >= snapshot['limit'] * STOP_PERCENT / 100:
+                    return {'status': 'hybrid_insufficient_headroom', 'nigri_writes': False}
                 context = browser.new_context()
+                # Asset-heavy teacher login UI is not needed to obtain cookies;
+                # keep scripts, documents, CSS and API calls untouched.
+                context.route('**/*', _hybrid_login_router)
                 page = context.new_page()
                 stage = 'browser_signin'
                 login(page)  # Uses the existing proven browser sign-in.
