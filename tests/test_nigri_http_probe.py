@@ -1,6 +1,7 @@
 """Read-only HTTP probe safety tests. No network and no Nigri writes."""
 import sys
 import unittest
+import requests
 from pathlib import Path
 from unittest.mock import patch
 
@@ -19,6 +20,7 @@ class FakeResponse:
 class FakeSession:
     def __init__(self, login_form=None, marks_page=None, redirect=None):
         self.calls = []
+        self.cookies = requests.cookies.RequestsCookieJar()
         self.login_form = login_form or (
             '<form method="post" action="/main/default_os_prog.asp?section=teachers">'
             '<input type="hidden" name="csrf" value="DO_NOT_DISCLOSE">'
@@ -30,6 +32,11 @@ class FakeSession:
             'Create New Mark</a>'
         )
         self.redirect = redirect
+
+    def prepare_request(self, request):
+        s = requests.Session()
+        s.cookies = self.cookies
+        return s.prepare_request(request)
 
     def __enter__(self): return self
     def __exit__(self, *_): return False
