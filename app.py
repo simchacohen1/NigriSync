@@ -138,6 +138,21 @@ def classtime_nigri_blank_mark_probe():
     return response
 
 
+# Entirely offline fictional HTTP-serialization rehearsal. It does not
+# authenticate to Nigri, access real Classtime reviews, launch Chromium,
+# read secrets, or send any network requests. Real grade saves stay paused.
+@app.route("/classtime/mock-save-simulation", methods=["POST"])
+def classtime_mock_save_simulation():
+    from classtime_auth import review_owner
+    if not review_owner(allow_diagnostic=False):
+        return jsonify({"error": "unauthorized"}), 401
+    from nigri_http_dry_run import run_offline_simulation
+    result = run_offline_simulation()
+    response = jsonify(result)
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 @app.route("/classtime/test-session", methods=["POST"])
 def classtime_test_session():
     import hmac
