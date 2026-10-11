@@ -114,6 +114,8 @@ class BlankMarkProbeTests(unittest.TestCase):
         self.assertFalse(diag['expected_asp_path'])
         self.assertEqual(diag['recognized_query_keys'], ['action', 'section', 'spec'])
         self.assertEqual(diag['unknown_query_key_count'], 2)
+        self.assertEqual(diag['safe_unknown_parameter_names'], ['testID'])
+        self.assertEqual(diag['redacted_parameter_name_count'], 1)
         self.assertEqual(diag['unsupported_action_key_count'], 1)
         self.assertTrue(diag['no_navigation'])
         self.assertNotIn('PRIVATE_TOKEN', str(result))
@@ -128,6 +130,22 @@ class BlankMarkProbeTests(unittest.TestCase):
         self.assertEqual(result['link_diagnostics']['recognized_query_keys'], [])
         self.assertFalse(result['link_diagnostics']['expected_asp_path'])
         self.assertNotIn('nigri-new-mark.asp', str(result))
+
+    def test_missing_query_names_are_reported_without_values(self):
+        target = ('/main/default_os_prog.asp?section=teachers&spec=tests'
+                  '&menuID=SECRET_NUMBER&position=SECRET_POSITION'
+                  '&token=SECRET_TOKEN&loginEmail=PRIVATE_PERSON')
+        html = '<a href="' + target.replace('&', '&amp;') + '">Create New Mark</a>'
+        result, session = self.run_probe(html)
+        self.assertEqual(session.calls, [])
+        diag = result['link_diagnostics']
+        self.assertEqual(diag['safe_unknown_parameter_names'], ['menuID', 'position'])
+        self.assertEqual(diag['redacted_parameter_name_count'], 2)
+        self.assertEqual(diag['unknown_query_key_count'], 4)
+        self.assertFalse(result['nigri_writes'])
+        for secret in ('SECRET_NUMBER', 'SECRET_POSITION', 'SECRET_TOKEN',
+                       'PRIVATE_PERSON', 'loginEmail'):
+            self.assertNotIn(secret, str(result))
 
     def test_multiple_create_links_are_rejected(self):
         result, session = self.run_probe(LISTING + LISTING)
