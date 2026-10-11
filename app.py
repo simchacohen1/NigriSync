@@ -120,6 +120,24 @@ def classtime_nigri_hybrid_probe():
     return response
 
 
+# Owner-only read-only blank New Mark form inspection. At most one GET beyond
+# the hybrid School Marks listing; never submits Create Mark! or grade data.
+@app.route("/classtime/nigri-blank-mark-probe", methods=["POST"])
+def classtime_nigri_blank_mark_probe():
+    from classtime_auth import review_owner
+    if not review_owner(allow_diagnostic=False):
+        return jsonify({"error": "unauthorized"}), 401
+    from browser_runtime import run_browser
+    from nigri_http_probe import probe_hybrid
+    try:
+        result = run_browser(probe_hybrid, inspect_blank_form=True, _time_limit=90)
+    except Exception:
+        result = {"status": "blank_form_stopped_safely", "nigri_writes": False}
+    response = jsonify(result)
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 @app.route("/classtime/test-session", methods=["POST"])
 def classtime_test_session():
     import hmac

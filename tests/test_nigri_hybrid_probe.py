@@ -64,7 +64,7 @@ COOKIE = {'name': 'FAKE_SESSION', 'value': 'FAKE_PRIVATE_VALUE',
 
 
 class HybridProbeTests(unittest.TestCase):
-    def run_probe(self, html, cookies=None, memory_mib=160):
+    def run_probe(self, html, cookies=None, memory_mib=160, inspect_blank_form=False):
         state = {'browser_closed': False, 'requests': [], 'signins': 0}
         browser = FakeBrowser(COOKIE and ([COOKIE] if cookies is None else cookies), state)
         fake_playwright = FakeSyncPlaywright(browser)
@@ -82,7 +82,14 @@ class HybridProbeTests(unittest.TestCase):
             state['requests'].append((method, url))
             return FakeResponse(html)
 
-        with patch('playwright.sync_api.sync_playwright', return_value=fake_playwright), \
+        def fake_blank_probe(session, marks):
+            self.assertTrue(state['browser_closed'])
+            state['blank_probe_calls'] = state.get('blank_probe_calls', 0) + 1
+            self.assertTrue(marks.has_create_text)
+            return {'status': 'blank_form_found', 'no_submit_performed': True, 'nigri_writes': False}
+
+        with patch.object(probe, '_probe_blank_mark_form', side_effect=fake_blank_probe), \
+             patch('playwright.sync_api.sync_playwright', return_value=fake_playwright), \
              patch('nigri_playwright.login', side_effect=fake_login), \
              patch('classtime_reader._chromium_args', return_value=[]), \
              patch('browser_runtime.log_memory'), \
@@ -93,7 +100,7 @@ class HybridProbeTests(unittest.TestCase):
              patch.object(probe, '_request', side_effect=fake_http), \
              patch.dict('os.environ', {'NIGRI_USERNAME': 'FAKE_LOGIN',
                                         'NIGRI_PASSWORD': 'FAKE_PASSWORD'}):
-            answer = probe.probe_hybrid()
+            answer = probe.probe_hybrid(inspect_blank_form=inspect_blank_form)
         return answer, state
 
     def test_closes_browser_before_authenticated_marks_http_read(self):
@@ -162,6 +169,22 @@ class HybridProbeTests(unittest.TestCase):
             route = Route(kind)
             probe._hybrid_login_router(route)
             self.assertEqual(route.call, 'continue')
+
+    def test_optional_blank_form_integration_runs_after_browser_closed(self):
+        result, state = self.run_probe('<div>Create New Mark</div>', inspect_blank_form=True)
+        self.assertEqual(result['status'], 'hybrid_marks_found')
+        self.assertEqual(result['blank_form']['status'], 'blank_form_found')
+        self.assertEqual(state['blank_probe_calls'], 1)
+        self.assertTrue(state['browser_closed'])
+        self.assertFalse(result['nigri_writes'])
+
+    def test_blank_form_inspection_refused_when_marks_unconfirmed(self):
+        result, state = self.run_probe(
+            '<form><input name="login"><input name="password"></form>',
+            inspect_blank_form=True)
+        self.assertEqual(result['blank_form']['status'], 'blank_form_marks_unconfirmed')
+        self.assertEqual(state.get('blank_probe_calls', 0), 0)
+        self.assertFalse(result['nigri_writes'])
 
     def test_marks_unconfirmed_without_auth(self):
         html = '<form><input name="login"><input name="password"></form>'
