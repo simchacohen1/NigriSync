@@ -102,11 +102,24 @@ def probe():
         action = _safe_url(urljoin(LOGIN_URL, form['action'] or LOGIN_URL))
         # Retain hidden form tokens solely in memory; never return/log them.
         fields = {x['name']: x['value'] for x in form['inputs'] if x['name'] and x['type'] in ('hidden', 'submit')}
+        # Nigri uses an <input type="image" name="submit"> login button.
+        # A real click submits submit.x and submit.y, NOT a plain "submit"
+        # field. Classic ASP login handlers may depend on those coordinates.
+        image_buttons = [x for x in form['inputs'] if x['type'] == 'image' and x['name']]
+        if len(image_buttons) == 1:
+            fields[image_buttons[0]['name'] + '.x'] = '15'
+            fields[image_buttons[0]['name'] + '.y'] = '15'
         fields.update(login=username, password=password)
-        _request(session, 'POST', action, data=fields)  # SIGN-IN ONLY, never a marks POST
+        login_response = _request(session, 'POST', action, data=fields)  # SIGN-IN ONLY
+        login_after_post = _page(login_response)
+        login_field_names = {'login', 'password'}
+        post_still_login = any(login_field_names.issubset({i['name'] for i in f['inputs']}) for f in login_after_post.forms)
         marks = _page(_request(session, 'GET', MARKS_URL))
-        if any({'login', 'password'}.issubset({i['name'] for i in f['inputs']}) for f in marks.forms):
-            return {'status': 'login_not_accepted', 'nigri_writes': False}
+        if any(login_field_names.issubset({i['name'] for i in f['inputs']}) for f in marks.forms):
+            return {'status': 'login_not_accepted',
+                    'login_form_returned_after_post': post_still_login,
+                    'image_button_submitted': len(image_buttons) == 1,
+                    'nigri_writes': False}
         create = [a for a in marks.links if 'create new mark' in a['label'].lower()]
         field_names = {i['name'] for f in marks.forms for i in f['inputs']}
         recognizable = bool(create or {'testGradeID', 'testName', 'testDate'} & field_names)
