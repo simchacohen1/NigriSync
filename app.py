@@ -163,6 +163,39 @@ def classtime_get_review(review_id):
     return response
 
 
+@app.route("/classtime/reviews/<review_id>/sync-preview", methods=["POST"])
+def classtime_sync_preview(review_id):
+    """DRY RUN of 'Sync to Nigri'. Owner Google sign-in only (never the old key, never the diagnostic token).
+    Writes nothing to Nigri; its only Nigri contact is one read of the existing marks list."""
+    from classtime_auth import review_owner
+    from classtime_review import get_review
+    owner = review_owner(allow_diagnostic=False)
+    if not owner: return jsonify({"error": "unauthorized"}), 401
+    job = get_review(review_id, owner)
+    if not job: return jsonify({"error": "Review expired or unavailable. Load it again."}), 404
+    if job["status"] != "ready": return jsonify({"error": "The review is not ready yet"}), 409
+    import classtime_sync
+    from nigri_playwright import MARKS_TOPIC_IDS, list_mark_titles
+    try:
+        options = classtime_sync.validate_options(request.get_json(silent=True), job["result"], MARKS_TOPIC_IDS)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    titles, check_error = None, None
+    try:
+        from browser_runtime import run_browser
+        titles = run_browser(list_mark_titles)
+    except ValueError as e:
+        check_error = str(e)
+    except Exception:
+        check_error = "Could not read the existing Nigri marks"
+    try:
+        response = jsonify(classtime_sync.preview(job["result"], job["pdfs"], options, titles, check_error))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 @app.route("/classtime/reviews/<review_id>/pdfs/<pdf_id>", methods=["GET"])
 def classtime_review_pdf(review_id, pdf_id):
     from classtime_auth import review_owner

@@ -1634,3 +1634,24 @@ def debug_marks_create_and_view(
         "screenshot_b64": screenshot_b64,
         "delete_result": delete_result,
     }
+
+
+def list_mark_titles():
+    """
+    READ-ONLY. Titles of the School Marks Nigri already lists, taken from the marks list page alone
+    (no detail pages, no Create/Save/delete controls, nothing clicked or submitted). Used to check whether a
+    mark for a Classtime session already exists. Runs in the memory-guarded child process (see run_browser).
+    """
+    from classtime_reader import _chromium_args
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, args=_chromium_args())
+        try:
+            page = browser.new_page()
+            login(page)
+            page.goto(MARKS_URL)
+            page.wait_for_load_state("networkidle")
+            page.wait_for_timeout(500)
+            found = _discover_existing_mark_links(page)
+        finally:
+            browser.close()
+    return {"titles": [item["title"] for item in found if item.get("title")], "discovered_ids": len(found)}
