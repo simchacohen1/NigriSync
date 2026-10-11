@@ -62,6 +62,77 @@ class BlankMarkProbeTests(unittest.TestCase):
         self.assertNotIn('DO_NOT_DISCLOSE', str(result))
         self.assertNotIn('SECRET', str(result))
 
+    def test_readonly_header_form_structure_is_sanitized(self):
+        result, session = self.run_probe()
+        structure = result['header_form_structure']
+        self.assertEqual(structure['status'], 'header_form_structure_found')
+        self.assertEqual(structure['method'], 'post')
+        self.assertEqual(structure['action_kind'], 'same_host_teacher_asp')
+        self.assertEqual(structure['action_recognized_query_keys'], ['submit'])
+        self.assertEqual(structure['select_input_count'], 2)
+        self.assertTrue(structure['create_button_present'])
+        self.assertTrue(structure['form_not_submitted'])
+        self.assertFalse(structure['real_post_endpoint_verified'])
+        self.assertFalse(structure['real_post_result_verified'])
+        self.assertEqual([c[0] for c in session.calls], ['GET'])
+        self.assertNotIn('SENSITIVE_NAME', str(structure))
+        self.assertNotIn('DO_NOT_DISCLOSE', str(structure))
+        self.assertNotIn('SECRET', str(structure))
+        self.assertNotIn('=save', str(structure))
+
+    def test_hidden_token_values_names_and_unknown_query_redacted(self):
+        html = ('<form method="post" action="/main/default_os_prog.asp?'
+                'section=teachers&amp;spec=tests&amp;csrf=TOPSECRET&amp;testID=0">'
+                '<input type="hidden" name="privateSessionSecret" value="DO_NOT_EXPOSE">'
+                '<select name="testGradeID"></select>'
+                '<input name="testName" value="PRIVATE_TEST_NAME">'
+                '<input type="submit" name="submit" value="Create Mark!">'
+                '</form>')
+        result, session = self.run_probe(html=html)
+        summary = result['header_form_structure']
+        self.assertEqual(summary['status'], 'header_form_structure_found')
+        self.assertEqual(summary['hidden_input_count'], 1)
+        self.assertEqual(summary['action_kind'], 'same_host_teacher_asp')
+        self.assertEqual(summary['action_query_parameter_count'], 4)
+        self.assertEqual(summary['action_recognized_query_keys'], ['section', 'spec', 'testID'])
+        self.assertEqual(len(session.calls), 1)
+        for secret in ['TOPSECRET', 'DO_NOT_EXPOSE', 'privateSessionSecret', 'PRIVATE_TEST_NAME', 'csrf']:
+            self.assertNotIn(secret, str(summary))
+
+    def test_external_form_action_is_not_followed(self):
+        html = ('<form method="post" action="https://other.example/submit">'
+                '<select name="testGradeID"></select>'
+                '<input name="testName" value="PRIVATE">'
+                '<input type="submit" value="Create Mark!"></form>')
+        result, session = self.run_probe(html=html)
+        summary = result['header_form_structure']
+        self.assertEqual(summary['action_kind'], 'external_or_untrusted')
+        self.assertEqual(len(session.calls), 1)
+        self.assertEqual(session.calls[0][0], 'GET')
+        self.assertNotIn('other.example', str(summary))
+
+    def test_missing_form_method_does_not_assume_post(self):
+        html = ('<form action="">'
+                '<select name="testGradeID"></select>'
+                '<input name="testName">'
+                '</form>')
+        result, session = self.run_probe(html=html)
+        summary = result['header_form_structure']
+        self.assertEqual(summary['method'], 'get')
+        self.assertEqual(summary['action_kind'], 'current_blank_form_url')
+        self.assertFalse(summary['create_button_present'])
+        self.assertEqual(len(session.calls), 1)
+
+    def test_duplicate_or_fragmented_forms_not_treated_as_confirmed(self):
+        html = ('<form method="post"><input name="testGradeID"><input name="testName"></form>'
+                '<form method="post"><input name="testGradeID"><input name="testName"></form>')
+        result, session = self.run_probe(html=html)
+        summary = result['header_form_structure']
+        self.assertEqual(summary['status'], 'header_form_missing_or_ambiguous')
+        self.assertEqual(summary['candidate_count'], 2)
+        self.assertTrue(summary['form_not_submitted'])
+        self.assertEqual(len(session.calls), 1)
+
     def test_redirect_is_never_followed(self):
         result, session = self.run_probe(status=302)
         self.assertEqual(result['status'], 'blank_form_get_not_200')
