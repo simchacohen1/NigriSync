@@ -164,6 +164,54 @@ def probe():
 
 
 
+def _mark_entry_readonly_summary(page):
+    """Inspect structure of the already-fetched marks listing. Zero extra HTTP requests.
+
+    We deliberately DO NOT follow the Create New Mark link here. A URL
+    advertised by a third-party site is not proof that GET is side-effect-free.
+    Return only a preapproved set of control names and query keys, never values.
+    """
+    from urllib.parse import urlsplit
+    known_fields = {
+        'testGradeID', 'testTopicID', 'testName', 'testDate',
+        'testDesc', 'testCompleted',
+    }
+    fields = {i.get('name', '') for f in page.forms for i in f.get('inputs', [])}
+    detected = sorted(known_fields & fields)
+    links = [a for a in page.links if 'create new mark' in a.get('label', '').lower()]
+    target_kind, query_keys, action_kind = 'not_found', [], 'unknown'
+    if links:
+        href = links[0]['href'].strip()
+        if href.lower().startswith('javascript:'):
+            target_kind = 'javascript'
+        elif href.startswith('#'):
+            target_kind = 'fragment'
+        else:
+            try:
+                absolute = _safe_url(urljoin(MARKS_URL, href))
+                query = parse_qsl(urlsplit(absolute).query, keep_blank_values=True)
+                query_keys = sorted({k for k, _ in query
+                                     if k in {'section', 'spec', 'action', 'subSection', 'side'}})
+                actions = [v.lower() for k, v in query if k == 'action']
+                if len(actions) == 1 and actions[0] in {
+                    'new_test', 'add_test', 'create_test', 'new', 'new_mark',
+                    'add', 'create', 'new_test_form',
+                }:
+                    action_kind = actions[0]
+                target_kind = 'same_host_http_link'
+            except ValueError:
+                target_kind = 'external_or_unsafe'
+    return {
+        'entry_link_kind': target_kind,
+        'entry_link_action_kind': action_kind,
+        'entry_link_query_keys': query_keys,
+        'known_form_field_names': detected,
+        'create_button_text_found': page.has_create_text,
+        'forms_on_listing': len(page.forms),
+        'entry_form_was_not_opened': True,
+    }
+
+
 def probe_hybrid():
     """Read-only login through Chromium, then CLOSE it and GET marks over HTTP.
 
@@ -232,6 +280,7 @@ def probe_hybrid():
                 'browser_closed_before_http': True,
                 'transferred_cookie_count': len(browser_cookies),
                 'cookies_sent_to_marks': cookies_would_send,
+                'mark_entry_readonly': _mark_entry_readonly_summary(marks),
                 'nigri_writes': False,
             }
     except Exception:
