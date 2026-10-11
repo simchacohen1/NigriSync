@@ -35,6 +35,10 @@ class _Page(HTMLParser):
         self._a = None
         self.has_create_text = False
         self._select = None
+        self.external_script_count = 0
+        self.inline_script_seen = False
+        self._inside_inline_script = False
+        self._inline_script_sample = ''
 
     def handle_starttag(self, tag, attrs):
         a = dict(attrs)
@@ -49,6 +53,10 @@ class _Page(HTMLParser):
             })
         elif tag == 'select' and self._form is not None:
             field = {'name': a.get('name', ''), 'type': tag, 'value': '', 'options': []}
+            if field['name'] == 'testGradeID':
+                # Keep event text in memory for a whitelist-only summary;
+                # never return JavaScript, selectors, URLs, or field values.
+                field['onchange_hint'] = (a.get('onchange') or '')[:512]
             self._form['inputs'].append(field)
             # Never collect option values for other selects (which might
             # contain names/student records); only these public mark selectors.
@@ -60,11 +68,29 @@ class _Page(HTMLParser):
             self._form['inputs'].append({'name': a.get('name', ''), 'type': tag, 'value': ''})
         elif tag == 'button' and self._form is not None and a.get('name'):
             self._form['inputs'].append({'name': a['name'], 'type': a.get('type', 'submit').lower(), 'value': a.get('value', '')})
+        elif tag == 'script':
+            if a.get('src'):
+                self.external_script_count = min(self.external_script_count + 1, 100)
+            else:
+                self.inline_script_seen = True
+                self._inside_inline_script = True
         elif tag == 'a':
             self._a = {'href': a.get('href', ''), 'label': ''}
             self.links.append(self._a)
 
     def handle_data(self, data):
+        if self._inside_inline_script:
+            # Aggregate keywords only. Never retain or return script bodies.
+            snippet = data.lower()
+            if 'testgradeid' in snippet:
+                self._inline_script_sample += ' grade-event'
+            if 'testtopicid' in snippet:
+                self._inline_script_sample += ' topic-event'
+            if 'xmlhttprequest' in snippet or '.ajax(' in snippet or 'fetch(' in snippet:
+                self._inline_script_sample += ' ajax-keyword'
+            if '.post(' in snippet or "method:'post'" in snippet or 'method:"post"' in snippet:
+                self._inline_script_sample += ' post-keyword'
+            self._inline_script_sample = self._inline_script_sample[:512]
         if 'create new mark' in data.lower():
             self.has_create_text = True
         if self._a is not None:
@@ -76,6 +102,8 @@ class _Page(HTMLParser):
             self._select = None
         if tag == 'select':
             self._select = None
+        if tag == 'script':
+            self._inside_inline_script = False
         if tag == 'a':
             self._a = None
 
@@ -529,6 +557,57 @@ def _readonly_mark_form_dependencies(page):
     }
 
 
+def _readonly_topic_refresh_preflight(page):
+    """Discover trigger structure, but NEVER select a grade or perform AJAX.
+
+    Static form inspection alone cannot establish what the server would
+    return after choosing B3 ET. No handler names, bodies, or URLs leave RAM.
+    """
+    forms = [f for f in page.forms
+             if {'testGradeID', 'testName'}.issubset(
+                 {i.get('name') for i in f['inputs']})]
+    if len(forms) != 1:
+        return {'status': 'form_ambiguous', 'network_requests_sent': 0,
+                'post_refresh_verified': False, 'nigri_writes': False}
+    grades = [i for i in forms[0]['inputs']
+              if i.get('name') == 'testGradeID' and i.get('type') == 'select']
+    if len(grades) != 1:
+        return {'status': 'grade_selector_ambiguous', 'network_requests_sent': 0,
+                'post_refresh_verified': False, 'nigri_writes': False}
+    event = grades[0].get('onchange_hint', '').lower()
+    hints = page._inline_script_sample
+    inline_change = bool(event)
+    if 'submit(' in event or '.submit(' in event or 'form.submit' in event:
+        kind = 'possible_form_submit'
+    elif any(x in event for x in ('ajax', 'fetch(', 'xmlhttprequest', '.post(', '.get(')):
+        kind = 'inline_ajax_or_fetch'
+    elif inline_change:
+        kind = 'named_or_inline_handler'
+    elif 'grade-event' in hints and 'ajax-keyword' in hints:
+        kind = 'script_ajax_possible'
+    elif page.external_script_count:
+        kind = 'external_script_handler_possible'
+    else:
+        kind = 'handler_not_identified'
+    return {
+        'status': 'trigger_inspected',
+        'class_change_handler_kind': kind,
+        'inline_change_handler_present': inline_change,
+        'external_script_count': page.external_script_count,
+        'inline_script_present': page.inline_script_seen,
+        'inline_script_grade_reference_found': 'grade-event' in hints,
+        'inline_script_topic_reference_found': 'topic-event' in hints,
+        'inline_script_ajax_keyword_found': 'ajax-keyword' in hints,
+        'inline_script_post_keyword_found': 'post-keyword' in hints,
+        'topic_ajax_http_method_verified': False,
+        'post_refresh_verified': False,
+        'class_selection_performed': False,
+        'ajax_request_performed': False,
+        'network_requests_sent': 0,
+        'nigri_writes': False,
+    }
+
+
 def _offline_header_packet_check(structure):
     """Prepare a dummy header POST *in memory* using approved names only.
 
@@ -617,6 +696,7 @@ def _probe_blank_mark_form(session, marks):
         'header_form_structure': form_structure,
         'offline_header_rehearsal': header_rehearsal,
         'readonly_form_dependencies': _readonly_mark_form_dependencies(page),
+        'topic_refresh_preflight': _readonly_topic_refresh_preflight(page),
         'only_one_extra_get': True,
         'no_submit_performed': True,
         'nigri_writes': False,
