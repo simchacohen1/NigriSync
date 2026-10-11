@@ -18,7 +18,7 @@ class FakeResponse:
 
 
 class FakeSession:
-    def __init__(self, login_form=None, marks_page=None, redirect=None):
+    def __init__(self, login_form=None, marks_page=None, redirect=None, blank_form=None):
         self.calls = []
         self.cookies = requests.cookies.RequestsCookieJar()
         self.login_form = login_form or (
@@ -28,10 +28,18 @@ class FakeSession:
             '<input type="image" name="submit" src="login-Button.gif"></form>'
         )
         self.marks_page = marks_page or (
-            '<p>Welcome</p><a href="/main/default_os_prog.asp?section=teachers&amp;spec=tests&amp;action=create_test">'
+            '<p>Welcome</p><a href="/main/default_os_prog.asp?section=teachers&amp;spec=tests&amp;testCoursTypeSelect=&amp;testGradeSelect=&amp;testID=0&amp;testTopicSelect=">'
             'Create New Mark</a>'
         )
         self.redirect = redirect
+        self.blank_form = blank_form or (
+            '<form method="post" action="/main/default_os_prog.asp?section=teachers&amp;spec=tests">'
+            '<input type="hidden" name="privateToken" value="HIDDEN_VALUE">'
+            '<select name="testGradeID"><option>B3 ET</option></select>'
+            '<select name="testTopicID"><option>Shoroshim</option></select>'
+            '<input name="testName"><input name="testDate">'
+            '<input type="submit" value="Create Mark!"></form>'
+        )
 
     def prepare_request(self, request):
         prepared = request.prepare()
@@ -49,15 +57,17 @@ class FakeSession:
             return FakeResponse(status=302, headers={'Location': self.redirect})
         if method == 'POST':
             return FakeResponse('<p>Welcome</p>')
+        if 'testCoursTypeSelect=' in url:
+            return FakeResponse(self.blank_form)
         if len(self.calls) == 1:
             return FakeResponse(self.login_form)
         return FakeResponse(self.marks_page)
 
 
 class ProbeTests(unittest.TestCase):
-    def execute(self, session):
+    def execute(self, session, *, inspect_blank_form=False):
         with patch('requests.Session', return_value=session), patch.dict('os.environ', {'NIGRI_USERNAME': 'FAKE_USER', 'NIGRI_PASSWORD': 'FAKE_PASSWORD'}):
-            return probe.probe()
+            return probe.probe(inspect_blank_form=inspect_blank_form)
 
     def test_only_login_post_and_marks_get(self):
         session = FakeSession()
@@ -75,9 +85,26 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(session.calls[1][2]['submit.x'], '15')
         self.assertEqual(session.calls[1][2]['submit.y'], '15')
         self.assertNotIn('submit', session.calls[1][2])
-        self.assertEqual(result['create_link_query_keys'], ['action', 'section', 'spec'])
+        self.assertEqual(result['create_link_query_keys'], ['section', 'spec', 'testID'])
         self.assertNotIn('FAKE_PASSWORD', str(result))
         self.assertNotIn('DO_NOT_DISCLOSE', str(result))
+
+    def test_blank_mark_inspection_is_http_only_and_follows_one_allowlisted_get(self):
+        session = FakeSession()
+        result = self.execute(session, inspect_blank_form=True)
+        blank = result['blank_form']
+        self.assertEqual(blank['status'], 'blank_form_found')
+        self.assertTrue(blank['no_submit_performed'])
+        self.assertFalse(blank['nigri_writes'])
+        self.assertEqual([x[0] for x in session.calls], ['GET', 'POST', 'GET', 'GET', 'GET'])
+        self.assertIn('testGradeID', blank['field_names'])
+        self.assertNotIn('HIDDEN_VALUE', str(result))
+
+    def test_blank_mark_get_is_not_followed_when_marks_page_is_unconfirmed(self):
+        session = FakeSession(marks_page='<p>Blank page</p>')
+        result = self.execute(session, inspect_blank_form=True)
+        self.assertEqual(result['blank_form']['status'], 'blank_form_marks_unconfirmed')
+        self.assertEqual([x[0] for x in session.calls], ['GET', 'POST', 'GET', 'GET'])
 
     def test_refuses_login_form_action_outside_host(self):
         s = FakeSession(login_form='<form method="post" action="https://elsewhere.test/login">'

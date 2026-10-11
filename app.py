@@ -100,19 +100,23 @@ def classtime_nigri_http_probe():
 # HTTP save path has been verified and approved, block all Classtime writes
 # on the server, including calls bypassing the website's disabled controls.
 CLASSTIME_SAVES_PAUSED = True
+# The only supported next step is one separately authorized, one-student
+# test. This in-memory gate is consumed by any result that could have written.
+CLASSTIME_TEST_SAVE_STATE = "paused"  # paused -> armed -> in_progress -> consumed
+import threading
+CLASSTIME_TEST_SAVE_LOCK = threading.Lock()
 
 
-# Hybrid diagnostic: use the established browser login only, CLOSE Chromium,
-# then test a read-only HTTP GET of School Marks. No grade writes.
+# Backward-compatible read-only route; use the requests-only HTTP sign-in.
 @app.route("/classtime/nigri-hybrid-probe", methods=["POST"])
 def classtime_nigri_hybrid_probe():
     from classtime_auth import review_owner
     if not review_owner(allow_diagnostic=False):
         return jsonify({"error": "unauthorized"}), 401
     from browser_runtime import run_browser
-    from nigri_http_probe import probe_hybrid
+    from nigri_http_probe import probe
     try:
-        result = run_browser(probe_hybrid, _time_limit=90)
+        result = run_browser(probe, _time_limit=90)
     except Exception:
         result = {"status": "hybrid_stopped_by_memory_guard", "nigri_writes": False}
     response = jsonify(result)
@@ -120,17 +124,18 @@ def classtime_nigri_hybrid_probe():
     return response
 
 
-# Owner-only read-only blank New Mark form inspection. At most one GET beyond
-# the hybrid School Marks listing; never submits Create Mark! or grade data.
+# Owner-only read-only blank New Mark form inspection over HTTP. At most one
+# validated GET beyond the School Marks listing; never launches Chromium or
+# submits Create Mark! or grade data.
 @app.route("/classtime/nigri-blank-mark-probe", methods=["POST"])
 def classtime_nigri_blank_mark_probe():
     from classtime_auth import review_owner
     if not review_owner(allow_diagnostic=False):
         return jsonify({"error": "unauthorized"}), 401
     from browser_runtime import run_browser
-    from nigri_http_probe import probe_hybrid
+    from nigri_http_probe import probe
     try:
-        result = run_browser(probe_hybrid, inspect_blank_form=True, _time_limit=90)
+        result = run_browser(probe, inspect_blank_form=True, _time_limit=90)
     except Exception:
         result = {"status": "blank_form_stopped_safely", "nigri_writes": False}
     response = jsonify(result)
@@ -153,24 +158,17 @@ def classtime_mock_save_simulation():
     return response
 
 
-# One-off owner-only B3 ET topic-refresh method discovery. Chromium first
-# signs in, then the class-change router ABORTS every outgoing request.
-# This cannot save a mark or fetch refreshed topics.
+# The former topic trace launched Chromium on Render. Keep the route closed so
+# stale pages cannot start another browser probe on the Free instance.
 @app.route("/classtime/nigri-topic-blocked-trace", methods=["POST"])
 def classtime_nigri_topic_blocked_trace():
     from classtime_auth import review_owner
     if not review_owner(allow_diagnostic=False):
         return jsonify({"error": "unauthorized"}), 401
-    from browser_runtime import run_browser
-    from nigri_topic_trace import blocked_topic_refresh_trace
-    try:
-        result = run_browser(blocked_topic_refresh_trace, _time_limit=90)
-    except Exception:
-        result = {"status": "trace_stopped_by_memory_guard_or_timeout",
-                  "nigri_writes": False}
-    response = jsonify(result)
+    response = jsonify({"status": "disabled_browser_probe", "nigri_writes": False,
+                        "detail": "Nigri topic refresh inspection now runs in the connected browser."})
     response.headers["Cache-Control"] = "no-store"
-    return response
+    return response, 410
 
 
 @app.route("/classtime/test-session", methods=["POST"])
@@ -276,7 +274,12 @@ def classtime_sync_preview(review_id):
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     try:
-        response = jsonify(classtime_sync.preview(job["result"], job["pdfs"], options, None, duplicate_check_disabled=True))
+        answer = classtime_sync.preview(job["result"], job["pdfs"], options, None, duplicate_check_disabled=True)
+        # A real save stays hidden in the browser until the server-side pause
+        # is explicitly removed after the owner's separate test approval.
+        answer["real_save_enabled"] = (not CLASSTIME_SAVES_PAUSED and
+                                       CLASSTIME_TEST_SAVE_STATE == "armed")
+        response = jsonify(answer)
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     response.headers["Cache-Control"] = "no-store"
@@ -287,10 +290,11 @@ def classtime_sync_preview(review_id):
 def classtime_sync_save(review_id):
     """The REAL save of a Classtime review into Nigri (through the existing run_marks_sync code).
     Owner Google sign-in only. Rows are rebuilt here from the loaded review; nothing from the browser is trusted but the choices."""
+    global CLASSTIME_TEST_SAVE_STATE
     from classtime_auth import review_owner
     owner = review_owner(allow_diagnostic=False)
     if not owner: return jsonify({"error": "unauthorized"}), 401
-    if CLASSTIME_SAVES_PAUSED:
+    if CLASSTIME_SAVES_PAUSED or CLASSTIME_TEST_SAVE_STATE == "paused":
         return jsonify({"saved": False, "error": "Classtime saving is paused during the browser-free Nigri investigation. Nothing was written."}), 423
     import re
     import classtime_save as save
@@ -298,8 +302,31 @@ def classtime_sync_save(review_id):
     from nigri_playwright import MARKS_TOPIC_IDS
     from browser_runtime import run_browser
     body = request.get_json(silent=True)
+    test_save = False
+    with CLASSTIME_TEST_SAVE_LOCK:
+        if CLASSTIME_TEST_SAVE_STATE in ("in_progress", "consumed"):
+            return jsonify({"saved": False, "error": "The one authorized test attempt is already running or has been used. No second mark will be created."}), 409
+        if CLASSTIME_TEST_SAVE_STATE == "armed":
+            if not isinstance(body, dict) or not body.get("only_student"):
+                return jsonify({"saved": False, "error": "The authorized test permits one chosen student only. Whole-class saving is not available."}), 423
+            CLASSTIME_TEST_SAVE_STATE = "in_progress"
+            test_save = True
+        elif CLASSTIME_TEST_SAVE_STATE != "whole_class":
+            return jsonify({"saved": False, "error": "Classtime saving is paused. Nothing was written."}), 423
+
+    def settle_test_gate(consumed):
+        global CLASSTIME_TEST_SAVE_STATE
+        nonlocal test_save
+        if not test_save:
+            return
+        with CLASSTIME_TEST_SAVE_LOCK:
+            if CLASSTIME_TEST_SAVE_STATE == "in_progress":
+                CLASSTIME_TEST_SAVE_STATE = "consumed" if consumed else "armed"
+
     job, refusal = save.claim(review_id, owner)   # the lock: a second click or a second save is refused here
-    if refusal: return jsonify({"saved": False, "error": refusal[1]}), refusal[0]
+    if refusal:
+        settle_test_gate(False)
+        return jsonify({"saved": False, "error": refusal[1]}), refusal[0]
     result, pdfs = job["result"], job["pdfs"]
     key = (result["session_code"], result["class_section"])
     def respond(payload, code):
@@ -309,9 +336,11 @@ def classtime_sync_save(review_id):
         try:
             planned = save.plan(result, pdfs, body, MARKS_TOPIC_IDS)
         except ValueError as e:
-            save.settle(review_id, "none"); return respond({"saved": False, "error": str(e)}, 400)
+            save.settle(review_id, "none"); settle_test_gate(False)
+            return respond({"saved": False, "error": str(e)}, 400)
         if planned["hard_blockers"]:
             save.settle(review_id, "none")
+            settle_test_gate(False)
             return respond({"saved": False, "error": "Not saved: " + "; ".join(planned["hard_blockers"]), "blockers": planned["hard_blockers"], "can_override": False}, 409)
         # No Nigri duplicate lookup: it launched a second browser and could
         # exhaust Render Free memory. Keep the existing in-process ledger.
@@ -321,9 +350,11 @@ def classtime_sync_save(review_id):
         blocked = save.check_override(body, planned["options"], status, detail, result["session_code"])
         if blocked:
             save.settle(review_id, "none")
+            settle_test_gate(False)
             return respond({"saved": False, "error": blocked[1], "duplicate_check": {"status": status, "detail": detail}, "can_override": status in save.OVERRIDABLE}, blocked[0])
     except Exception:
         save.settle(review_id, "none")
+        settle_test_gate(False)
         return respond({"saved": False, "error": "Nothing was saved. Something went wrong before the save started."}, 500)
     # Past this point Nigri may be written to. Anything that goes wrong is reported as a possible partial mark and never retried.
     try:
@@ -332,13 +363,16 @@ def classtime_sync_save(review_id):
         message = str(e)
         if message.startswith(save.NOT_STARTED):
             save.settle(review_id, "none")
+            settle_test_gate(False)
             return respond({"saved": False, "error": "Nothing was saved: the server is busy with another browser job. Try again in a minute."}, 409)
         save.settle(review_id, "unknown", key=key)
+        settle_test_gate(True)
         print("Classtime save: state=unknown reason=" + save.classify_stop(message), flush=True)
         return respond({"saved": False, "partial_mark_may_exist": True, "do_not_retry": True,
                         "message": "The save was stopped (" + save.classify_stop(message) + "). A partial mark MAY exist in Nigri. Check Nigri before doing anything else. It will not be retried automatically."}, 500)
     except Exception:
         save.settle(review_id, "unknown", key=key)
+        settle_test_gate(True)
         print("Classtime save: state=unknown reason=error", flush=True)
         return respond({"saved": False, "partial_mark_may_exist": True, "do_not_retry": True,
                         "message": "The save failed unexpectedly. A partial mark MAY exist in Nigri. Check Nigri before doing anything else. It will not be retried automatically."}, 500)
@@ -351,6 +385,7 @@ def classtime_sync_save(review_id):
     final_saved = any("Final Save! submitted" in l for l in lines)
     state = "saved" if complete else "partial"
     save.settle(review_id, state, test_id=test_id, key=key)
+    settle_test_gate(True)
     print("Classtime save: state=" + state + " one_boy=" + str(planned["only"] is not None) + " test_id=" + str(test_id)
           + " saved=" + str(sum(b["outcome"] == "saved" for b in per_boy)) + " failed=" + str(sum(b["outcome"] in ("failed", "not reached") for b in per_boy)), flush=True)
     if complete:

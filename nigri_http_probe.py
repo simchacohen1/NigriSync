@@ -138,8 +138,11 @@ def _request(session, method, url, *, data=None, trace=None):
     raise ValueError('Too many Nigri redirects')
 
 
-def probe():
-    """Read only, login + marks index; return safe capability details."""
+def probe(*, inspect_blank_form=False):
+    """Read-only HTTP sign-in and marks listing, optionally followed by one allowlisted blank-form GET.
+
+    This path deliberately uses requests only; it never launches Chromium.
+    """
     username = os.environ.get('NIGRI_USERNAME')
     password = os.environ.get('NIGRI_PASSWORD')
     if not username or not password:
@@ -196,7 +199,10 @@ def probe():
         # A login form in a shared header is not enough to prove login failure if
         # the page also contains the authenticated marks controls.
         if marks_still_login and not recognizable:
-            return {'status': 'login_not_accepted', **diagnostics}
+            result = {'status': 'login_not_accepted', **diagnostics}
+            if inspect_blank_form:
+                result['blank_form'] = {'status': 'blank_form_marks_unconfirmed', 'nigri_writes': False}
+            return result
         kind = 'none'
         keys = []
         if create:
@@ -205,10 +211,16 @@ def probe():
             if kind == 'http_link':
                 target = _safe_url(urljoin(MARKS_URL, href))
                 keys = sorted(set(k for k, _ in parse_qsl(urlsplit(target).query)))[:16]
-        return {'status': 'marks_listing_found' if recognizable else 'marks_page_unconfirmed',
-                **diagnostics, 'http_login_succeeded': recognizable, 'create_link_found': bool(create),
-                'create_link_kind': kind, 'create_link_query_keys': keys,
-                'form_count': len(marks.forms), 'nigri_writes': False}
+        result = {'status': 'marks_listing_found' if recognizable else 'marks_page_unconfirmed',
+                  **diagnostics, 'http_login_succeeded': recognizable, 'create_link_found': bool(create),
+                  'create_link_kind': kind, 'create_link_query_keys': keys,
+                  'form_count': len(marks.forms), 'nigri_writes': False}
+        if inspect_blank_form:
+            if recognizable:
+                result['blank_form'] = _probe_blank_mark_form(session, marks)
+            else:
+                result['blank_form'] = {'status': 'blank_form_marks_unconfirmed', 'nigri_writes': False}
+        return result
 
 
 
