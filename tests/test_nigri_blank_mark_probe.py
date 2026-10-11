@@ -180,7 +180,7 @@ class BlankMarkProbeTests(unittest.TestCase):
     def test_sensitive_selector_values_are_redacted(self):
         link = ('/main/default_os_prog.asp?section=teachers&spec=tests'
                 '&testCoursTypeSelect=SENSITIVE_DATA&testID=PRIVATE_ID'
-                '&testGradeSelect=unknown&testTopicSelect=-9')
+                '&testGradeSelect=HIDDEN_TEXT_VALUE&testTopicSelect=-9')
         result, session = self.run_probe(
             '<a href="' + link.replace('&', '&amp;') + '">Create New Mark</a>')
         self.assertEqual(session.calls, [])
@@ -188,7 +188,7 @@ class BlankMarkProbeTests(unittest.TestCase):
         self.assertEqual(set(diag['selection_parameter_kinds'].values()),
                          {'other_redacted'})
         self.assertTrue(diag['test_id_may_reference_existing_mark'])
-        for value in ('SENSITIVE_DATA', 'PRIVATE_ID', 'unknown', '-9'):
+        for value in ('SENSITIVE_DATA', 'PRIVATE_ID', 'HIDDEN_TEXT_VALUE', '-9'):
             self.assertNotIn(value, str(result))
 
     def test_duplicate_test_id_is_not_considered_blank(self):
