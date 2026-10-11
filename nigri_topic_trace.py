@@ -112,7 +112,7 @@ def blocked_topic_refresh_trace():
                 log_memory('blocked-topic-trace: chromium launched')
                 if not _headroom_or_stop():
                     return {'status': 'insufficient_memory', 'nigri_writes': False}
-                context = browser.new_context()
+                context = browser.new_context(service_workers='block')
                 context.route('**/*', _hybrid_login_router)
                 page = context.new_page()
                 stage = 'login'
