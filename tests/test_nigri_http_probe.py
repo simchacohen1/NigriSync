@@ -1,6 +1,7 @@
 """Read-only HTTP probe safety tests. No network and no Nigri writes."""
 import sys
 import unittest
+import requests
 from pathlib import Path
 from unittest.mock import patch
 
@@ -19,6 +20,7 @@ class FakeResponse:
 class FakeSession:
     def __init__(self, login_form=None, marks_page=None, redirect=None):
         self.calls = []
+        self.cookies = requests.cookies.RequestsCookieJar()
         self.login_form = login_form or (
             '<form method="post" action="/main/default_os_prog.asp?section=teachers">'
             '<input type="hidden" name="csrf" value="DO_NOT_DISCLOSE">'
@@ -30,6 +32,13 @@ class FakeSession:
             'Create New Mark</a>'
         )
         self.redirect = redirect
+
+    def prepare_request(self, request):
+        prepared = request.prepare()
+        cookie_header = requests.cookies.get_cookie_header(self.cookies, prepared)
+        if cookie_header:
+            prepared.headers['Cookie'] = cookie_header
+        return prepared
 
     def __enter__(self): return self
     def __exit__(self, *_): return False
@@ -56,7 +65,11 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(result['status'], 'marks_listing_found')
         self.assertTrue(result['http_login_succeeded'])
         self.assertFalse(result['nigri_writes'])
-        self.assertEqual([x[0] for x in session.calls], ['GET', 'POST', 'GET'])
+        self.assertEqual([x[0] for x in session.calls], ['GET', 'POST', 'GET', 'GET'])
+        self.assertEqual(result['cookies_after_login_count'], 0)
+        self.assertFalse(result['cookies_sent_to_marks'])
+        self.assertFalse(result['login_form_at_teacher_home'])
+        self.assertFalse(result['login_form_at_marks'])
         self.assertTrue(session.calls[1][1].startswith(probe.BASE))
         self.assertEqual(session.calls[1][2]['csrf'], 'DO_NOT_DISCLOSE')
         self.assertEqual(session.calls[1][2]['submit.x'], '15')
@@ -113,7 +126,27 @@ class ProbeTests(unittest.TestCase):
         result = self.execute(s)
         self.assertTrue(result['login_form_returned_after_post'])
         self.assertNotIn('FAKE_PASSWORD', str(result))
-        self.assertEqual([x[0] for x in s.calls], ['GET', 'POST', 'GET'])
+        self.assertEqual([x[0] for x in s.calls], ['GET', 'POST', 'GET', 'GET'])
+
+    def test_shared_login_header_does_not_mask_real_marks_listing(self):
+        s = FakeSession(marks_page=(
+            '<form><input name="login"><input name="password"></form>'
+            '<div>Create New Mark</div>'))
+        result = self.execute(s)
+        self.assertEqual(result['status'], 'marks_listing_found')
+        self.assertTrue(result['login_form_at_marks'])
+        self.assertTrue(result['marks_create_text_found'])
+        self.assertFalse(result['nigri_writes'])
+
+    def test_session_diagnostics_only_include_safe_counts(self):
+        s = FakeSession(marks_page='<form><input name="login"><input name="password"></form>')
+        result = self.execute(s)
+        self.assertTrue(result['login_form_at_teacher_home'])
+        self.assertTrue(result['login_form_at_marks'])
+        self.assertFalse(result['cookies_sent_to_marks'])
+        self.assertEqual(result['login_post_redirect_count'], 0)
+        self.assertNotIn('FAKE_PASSWORD', str(result))
+        self.assertNotIn('FAKE_USER', str(result))
 
     def test_page_is_not_assumed_usable_without_evidence(self):
         s = FakeSession(marks_page='<p>Blank page</p>')
