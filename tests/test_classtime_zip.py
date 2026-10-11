@@ -69,5 +69,35 @@ class ZipTests(unittest.TestCase):
         finally:
             import shutil; shutil.rmtree(str(Path(next(iter(pdfs.values()))).parent), ignore_errors=True)
 
+class ClassCheckTests(unittest.TestCase):
+    def full(self, reports, section='B3 ET'):
+        import tempfile, shutil
+        from classtime_review import attach_archive_reports
+        with tempfile.TemporaryDirectory() as d:
+            path = make_zip(d, reports)
+            review = cz.review_from_zip(path, 'ABC123', section)
+            result, pdfs = attach_archive_reports(review, path)
+            if pdfs: shutil.rmtree(str(Path(next(iter(pdfs.values()))).parent), ignore_errors=True)
+            return result
+    def test_blank_class_field_with_underscored_title_is_accepted(self):
+        result = self.full([report('Sample Alpha', '9', title='B3_ET Test Quiz', klass='')])
+        self.assertEqual(result['students'][0]['pdf_status'], 'verified')
+    def test_lowercase_and_spacing_are_accepted(self):
+        self.full([report('Sample Alpha', '9', title='b3  et Test Quiz', klass='b3_et')])
+    def test_filled_class_field_naming_another_class_is_refused(self):
+        with self.assertRaises(ValueError): self.full([report('Sample Alpha', '9', klass='B3 WT')])
+    def test_blank_class_field_and_other_class_title_is_refused(self):
+        with self.assertRaises(ValueError): self.full([report('Sample Alpha', '9', title='B3 WT Test Quiz', klass='')])
+    def test_similar_class_name_is_not_a_match(self):
+        with self.assertRaises(ValueError): self.full([report('Sample Alpha', '9', title='B3 ETA Test Quiz', klass='')])
+    def test_class_log_has_no_names_or_scores(self):
+        import contextlib
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            with self.assertRaises(ValueError): self.full([report('Sample Alpha', '9', klass='B3 WT')])
+        log = out.getvalue()
+        self.assertIn('picked=B3 ET', log); self.assertIn('pdf_class_field=B3 WT', log)
+        for secret in ('Sample Alpha', 'ABC123', '9 / 12'): self.assertNotIn(secret, log)
+
 if __name__ == '__main__':
     unittest.main()

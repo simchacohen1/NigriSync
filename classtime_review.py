@@ -58,6 +58,40 @@ def parse_session(rows, text, code, section):
     if not students: raise ValueError('No student score rows were found')
     return {'session_code': code, 'session_name': title.group(1), 'class_section': section, 'students': students, 'read_only': True, 'sync_enabled': False, 'nigri_writes': False}
 
+def norm_class(text):
+    """Uppercase, with underscores and runs of spaces treated as one space ("b3_et" == "B3 ET")."""
+    return ' '.join(re.split(r'[\s_]+', text.upper().strip())).strip()
+
+def class_in_text(text, section):
+    """The class appears as a whole word group (B3 ET matches 'B3 ET Quiz', not 'B3 ETA' or 'B3 WT')."""
+    return re.search(r'(?<![A-Z0-9])' + re.escape(norm_class(section)) + r'(?![A-Z0-9])', norm_class(text)) is not None
+
+def class_label(text):
+    """Safe label for logs: only short class-like text is shown, never other content."""
+    text = text.strip()
+    if not text: return 'blank'
+    return text if re.fullmatch(r'[A-Za-z0-9 _-]{1,12}', text) else 'other-text(len=' + str(len(text)) + ')'
+
+def class_field_text(text):
+    field = re.search(r'Class:[ \t]*([^\n]*)', text)
+    return field.group(1) if field else ''
+
+def title_class_labels(title):
+    return re.findall(r'(?<![A-Za-z0-9])[A-Za-z]\d[ _][A-Za-z]{2}(?![A-Za-z0-9])', title)
+
+def pdf_class_ok(text, section):
+    """If the PDF's Class field is filled in it must name the picked class. Classtime leaves it blank when the session
+    is not assigned to a class; then the session title in the PDF must name it instead. A different class is refused."""
+    field = class_field_text(text)
+    title = re.findall(r'Session:\s*[A-Z0-9]{6}\.?[ \t]*([^\n]*)', text)
+    title = title[-1] if title else ''
+    ok = class_in_text(field, section) if field.strip() else class_in_text(title, section)
+    if not ok:
+        print('Classtime class check: FAILED picked=' + section + ' pdf_class_field=' + class_label(field)
+              + ' title_class_labels=' + str(title_class_labels(title)) + ' compare=uppercase, underscores and repeated spaces '
+              'treated as one space, whole-word match; field used if filled in, otherwise session title', flush=True)
+    return ok
+
 def verify_pdf(data, students, session_code=None, class_section=None):
     is_path = isinstance(data, Path)
     size = data.stat().st_size if is_path else len(data)
@@ -82,7 +116,7 @@ def verify_pdf(data, students, session_code=None, class_section=None):
     student = matches[0]
     if session_code and not re.search(r'Session:\s*' + re.escape(session_code) + r'\b', text):
         raise ValueError('PDF identifies a different session')
-    if class_section and not re.search(r'Class:\s*' + re.escape(class_section) + r'\b', text):
+    if class_section and not pdf_class_ok(text, class_section):
         raise ValueError('PDF identifies a different class')
     if session_code:
         score = re.search(r'(\d+(?:\.\d+)?)\s*/\s*(\d+(?:\.\d+)?)\s*points\b', text)

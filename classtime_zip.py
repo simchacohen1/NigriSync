@@ -37,15 +37,17 @@ def parse_report_header(text, code):
 
 
 def review_from_zip(zip_path, code, section):
-    from classtime_review import match_student
-    students, titles, seen = [], set(), set()
+    from classtime_review import match_student, class_in_text, class_label, class_field_text
+    students, titles, seen, fields = [], set(), set(), []
     with zipfile.ZipFile(zip_path) as archive:
         entries = [e for e in archive.infolist() if not e.is_dir() and e.filename.lower().endswith('.pdf')]
         if not 0 < len(entries) <= 100 or sum(e.file_size for e in entries) > 20 * 1024 * 1024:
             raise ValueError('The Classtime ZIP has no reports or exceeds the limits')
         for entry in entries:
             if entry.file_size > 8 * 1024 * 1024: raise ValueError('PDF is too large')
-            name, points, maximum, title = parse_report_header(_first_page_text(archive.read(entry)), code)
+            page = _first_page_text(archive.read(entry))
+            name, points, maximum, title = parse_report_header(page, code)
+            fields.append(class_field_text(page))
             gc.collect()
             titles.add(title)
             if maximum <= 0 or (points is not None and not 0 <= points <= maximum): raise ValueError('A report score is out of range')
@@ -57,7 +59,10 @@ def review_from_zip(zip_path, code, section):
     if len(titles) != 1: raise ValueError('The reports in the ZIP are from different sessions')
     title = titles.pop()
     # Same class safety as the browser review: the session title itself must name the selected class.
-    if not re.search(r'\b' + re.escape(section) + r'\b', title): raise ValueError('Quiz title does not identify the selected class')
+    from classtime_review import title_class_labels
+    print('Classtime class check: picked=' + section + ' reports=' + str(len(students)) + ' title_class_labels=' + str(title_class_labels(title))
+          + ' pdf_class_fields=' + str(sorted({class_label(f) for f in fields})) + ' all_same_class_field=' + str(len({f.strip().upper() for f in fields}) == 1), flush=True)
+    if not class_in_text(title, section): raise ValueError('Quiz title does not identify the selected class')
     if len({s['maximum_points'] for s in students}) != 1: raise ValueError('Reports disagree on the maximum points')
     return {'session_code': code, 'session_name': title, 'class_section': section, 'students': students,
             'read_only': True, 'sync_enabled': False, 'nigri_writes': False}
