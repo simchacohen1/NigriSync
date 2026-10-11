@@ -101,6 +101,33 @@ class HybridProbeTests(unittest.TestCase):
         self.assertNotIn('FAKE_PASSWORD', str(result))
         self.assertNotIn('FAKE_PRIVATE_VALUE', str(result))
 
+    def test_mark_link_inspection_does_not_follow_any_navigation(self):
+        html = ('<a href="/main/default_os_prog.asp?section=teachers&amp;spec=tests'
+                '&amp;action=new_test">Create New Mark</a>'
+                '<form method="post" action="/unsafe">'
+                '<input name="testGradeID" value="DONOTRETURN">'
+                '<input name="testName" value="SECRETNAME"></form>')
+        result, state = self.run_probe(html)
+        self.assertEqual(result['status'], 'hybrid_marks_found')
+        self.assertEqual(state['requests'], [('GET', probe.MARKS_URL)])
+        summary = result['mark_entry_readonly']
+        self.assertEqual(summary['entry_link_kind'], 'same_host_http_link')
+        self.assertEqual(summary['entry_link_action_kind'], 'new_test')
+        self.assertEqual(summary['known_form_field_names'], ['testGradeID', 'testName'])
+        self.assertTrue(summary['entry_form_was_not_opened'])
+        self.assertNotIn('DONOTRETURN', str(result))
+        self.assertNotIn('SECRETNAME', str(result))
+
+    def test_mark_link_external_and_delete_urls_never_followed(self):
+        html = '<a href="https://other.test/delete">Create New Mark</a>'
+        result, state = self.run_probe(html)
+        self.assertEqual(result['mark_entry_readonly']['entry_link_kind'], 'external_or_unsafe')
+        self.assertEqual(state['requests'], [('GET', probe.MARKS_URL)])
+        html = '<a href="/main/default_os_prog.asp?section=teachers&amp;spec=tests&amp;action=del_test&amp;testID=42">Create New Mark</a>'
+        result, state = self.run_probe(html)
+        self.assertEqual(result['mark_entry_readonly']['entry_link_action_kind'], 'unknown')
+        self.assertEqual(state['requests'], [('GET', probe.MARKS_URL)])
+
     def test_marks_unconfirmed_without_auth(self):
         html = '<form><input name="login"><input name="password"></form>'
         result, state = self.run_probe(html)
