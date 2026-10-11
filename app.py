@@ -196,6 +196,97 @@ def classtime_sync_preview(review_id):
     return response
 
 
+@app.route("/classtime/reviews/<review_id>/sync-save", methods=["POST"])
+def classtime_sync_save(review_id):
+    """The REAL save of a Classtime review into Nigri (through the existing run_marks_sync code).
+    Owner Google sign-in only. Rows are rebuilt here from the loaded review; nothing from the browser is trusted but the choices."""
+    from classtime_auth import review_owner
+    owner = review_owner(allow_diagnostic=False)
+    if not owner: return jsonify({"error": "unauthorized"}), 401
+    import re
+    import classtime_save as save
+    import classtime_sync
+    from nigri_playwright import MARKS_TOPIC_IDS, list_mark_titles
+    from browser_runtime import run_browser
+    body = request.get_json(silent=True)
+    job, refusal = save.claim(review_id, owner)   # the lock: a second click or a second save is refused here
+    if refusal: return jsonify({"saved": False, "error": refusal[1]}), refusal[0]
+    result, pdfs = job["result"], job["pdfs"]
+    key = (result["session_code"], result["class_section"])
+    def respond(payload, code):
+        response = jsonify(payload); response.headers["Cache-Control"] = "no-store"
+        return response, code
+    try:
+        try:
+            planned = save.plan(result, pdfs, body, MARKS_TOPIC_IDS)
+        except ValueError as e:
+            save.settle(review_id, "none"); return respond({"saved": False, "error": str(e)}, 400)
+        if planned["hard_blockers"]:
+            save.settle(review_id, "none")
+            return respond({"saved": False, "error": "Not saved: " + "; ".join(planned["hard_blockers"]), "blockers": planned["hard_blockers"], "can_override": False}, 409)
+        # Read-only check: is this session already in Nigri?
+        status, detail = "could_not_check", None
+        try:
+            titles = run_browser(list_mark_titles)
+            if titles.get("titles"):
+                hits = classtime_sync.find_duplicates(titles["titles"], planned["options"], result["session_code"])
+                status = "duplicate" if hits else "clear"
+                detail = ('"' + hits[0] + '"') if hits else None
+            else:
+                detail = "the Nigri marks list showed no titled marks"
+        except ValueError as e:
+            detail = str(e)[:120]
+        except Exception:
+            detail = "could not read the existing Nigri marks"
+        if key in save.LEDGER and status == "clear":
+            status, detail = "duplicate", "saved earlier by this server (mark #" + str(save.LEDGER[key].get("test_id") or "?") + ")"
+        blocked = save.check_override(body, planned["options"], status, detail, result["session_code"])
+        if blocked:
+            save.settle(review_id, "none")
+            return respond({"saved": False, "error": blocked[1], "duplicate_check": {"status": status, "detail": detail}, "can_override": status in save.OVERRIDABLE}, blocked[0])
+    except Exception:
+        save.settle(review_id, "none")
+        return respond({"saved": False, "error": "Nothing was saved. Something went wrong before the save started."}, 500)
+    # Past this point Nigri may be written to. Anything that goes wrong is reported as a possible partial mark and never retried.
+    try:
+        outcome = run_browser(save.save_job, result, pdfs, body, MARKS_TOPIC_IDS, _time_limit=save.save_time_limit())
+    except ValueError as e:
+        message = str(e)
+        if message.startswith(save.NOT_STARTED):
+            save.settle(review_id, "none")
+            return respond({"saved": False, "error": "Nothing was saved: the server is busy with another browser job. Try again in a minute."}, 409)
+        save.settle(review_id, "unknown", key=key)
+        print("Classtime save: state=unknown reason=" + save.classify_stop(message), flush=True)
+        return respond({"saved": False, "partial_mark_may_exist": True, "do_not_retry": True,
+                        "message": "The save was stopped (" + save.classify_stop(message) + "). A partial mark MAY exist in Nigri. Check Nigri before doing anything else. It will not be retried automatically."}, 500)
+    except Exception:
+        save.settle(review_id, "unknown", key=key)
+        print("Classtime save: state=unknown reason=error", flush=True)
+        return respond({"saved": False, "partial_mark_may_exist": True, "do_not_retry": True,
+                        "message": "The save failed unexpectedly. A partial mark MAY exist in Nigri. Check Nigri before doing anything else. It will not be retried automatically."}, 500)
+    per_boy, warnings, complete = save.interpret(outcome, planned["rows"], planned["only"] is not None)
+    lines = outcome.get("results") or []
+    test_id = outcome.get("test_id")
+    if not test_id:
+        found = next((re.search(r"testID=(\d+)", l) for l in lines if l.startswith("Mark created")), None)
+        test_id = found.group(1) if found else None
+    final_saved = any("Final Save! submitted" in l for l in lines)
+    state = "saved" if complete else "partial"
+    save.settle(review_id, state, test_id=test_id, key=key)
+    print("Classtime save: state=" + state + " one_boy=" + str(planned["only"] is not None) + " test_id=" + str(test_id)
+          + " saved=" + str(sum(b["outcome"] == "saved" for b in per_boy)) + " failed=" + str(sum(b["outcome"] in ("failed", "not reached") for b in per_boy)), flush=True)
+    if complete:
+        message = "Saved to Nigri as mark #" + str(test_id) + "."
+    elif final_saved:
+        message = "Partly saved: mark #" + str(test_id) + " exists in Nigri but some boys did not save. Check Nigri. It will not be retried automatically."
+    else:
+        message = "The save stopped partway" + ((": mark #" + str(test_id) + " was created") if test_id else "") + ". A partial mark MAY exist in Nigri. Check Nigri. It will not be retried automatically."
+    return respond({"saved": complete, "partial_mark_may_exist": not complete, "do_not_retry": not complete, "nigri_writes": True,
+                    "test_id": test_id, "mark_name": planned["options"]["test_name"], "class_section": result["class_section"],
+                    "one_boy": planned["only"] is not None, "marking_done": planned["only"] is None,
+                    "per_boy": per_boy, "warnings": warnings, "message": message}, 200 if final_saved else 500)
+
+
 @app.route("/classtime/reviews/<review_id>/pdfs/<pdf_id>", methods=["GET"])
 def classtime_review_pdf(review_id, pdf_id):
     from classtime_auth import review_owner

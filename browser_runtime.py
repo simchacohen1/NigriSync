@@ -132,7 +132,7 @@ def _stop(process):
             process.kill(); process.join(timeout=1)
     process.close()
 
-def run_browser(target, *args, **kwargs):
+def run_browser(target, *args, _time_limit=240, **kwargs):
     global _OP_T0
     with browser_slot():
         _OP_T0 = time.monotonic()
@@ -155,7 +155,7 @@ def run_browser(target, *args, **kwargs):
                 if limit and used > limit * STOP_PERCENT / 100:
                     log_memory('SAFE-STOP: guard tripped')
                     raise ValueError('Classtime retrieval stopped safely before the service memory limit. Restore a saved review ZIP instead. No Nigri data was changed.')
-                if time.monotonic() - started > 240:
+                if time.monotonic() - started > _time_limit:
                     raise ValueError('Classtime retrieval timed out and its browser was stopped. No Nigri data was changed.')
                 if receive.poll(.1):
                     try: status, result = receive.recv()
