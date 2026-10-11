@@ -165,16 +165,19 @@ class RouteTests(unittest.TestCase):
             response = self.post(headers={'Authorization': 'Bearer t'})
         data = response.get_json()
         self.assertEqual(response.status_code, 200); self.assertTrue(data['dry_run']); self.assertFalse(data['nigri_writes']); self.assertFalse(data['can_save'])
-        self.assertEqual(data['duplicate_check']['status'], 'clear'); self.assertEqual(CALLS['write'], 0); self.assertEqual(CALLS['list'], 1)
+        self.assertEqual(data['duplicate_check']['status'], 'skipped'); self.assertEqual(CALLS['write'], 0); self.assertEqual(CALLS['list'], 0)
         self.assertEqual(data['counts']['will_save'], 1); self.assertNotIn('report_base64', json.dumps(data))
-    def test_duplicate_and_unreadable_lists_are_reported(self):
-        with self.owner():
-            with patch.object(stub, 'list_mark_titles', lambda: {'titles': ['Made Up Quiz (ABC123)'], 'discovered_ids': 1}):
-                self.assertEqual(self.post(headers={'Authorization': 'Bearer t'}).get_json()['duplicate_check']['status'], 'duplicate')
-            def boom(): raise ValueError('Nigri login failed')
-            with patch.object(stub, 'list_mark_titles', boom):
-                out = self.post(headers={'Authorization': 'Bearer t'}).get_json()
-        self.assertEqual(out['duplicate_check']['status'], 'could_not_check'); self.assertTrue(out['blockers']); self.assertEqual(CALLS['write'], 0)
+    def test_preview_does_not_contact_nigri_or_start_a_browser(self):
+        with self.owner(), patch.object(stub, 'list_mark_titles', side_effect=AssertionError('must not read Nigri')) as lookup, patch('browser_runtime.run_browser', side_effect=AssertionError('must not launch browser')) as browser:
+            response = self.post(headers={'Authorization': 'Bearer t'})
+        self.assertEqual(response.status_code, 200)
+        out = response.get_json()
+        self.assertEqual(out['duplicate_check']['status'], 'skipped')
+        self.assertEqual(out['blockers'], [])
+        self.assertFalse(out['nigri_writes'])
+        lookup.assert_not_called()
+        browser.assert_not_called()
+
     def test_bad_input_missing_and_unready_reviews(self):
         h = {'Authorization': 'Bearer t'}
         with self.owner():

@@ -176,28 +176,14 @@ class SaveTests(unittest.TestCase):
 
     # ---- duplicate check and the override ----
     def override(self, **extra): return {'allow_duplicate': True, 'confirm_session_code': 'ABC123', 'confirm_test_name': 'Made Up Quiz (ABC123)', **extra}
-    def test_duplicate_is_refused_without_the_override(self):
-        STATE['titles'] = {'titles': ['Made Up Quiz (ABC123)'], 'discovered_ids': 1}
-        out = self.post(); data = out.get_json()
-        self.assertEqual(out.status_code, 409); self.assertTrue(data['can_override']); self.assertEqual(data['duplicate_check']['status'], 'duplicate')
-        self.assertEqual(STATE['saves'], []); self.assertIsNone(self.state())
-        self.assertEqual(self.post({'allow_duplicate': 'yes'}).status_code, 409)       # must be exactly true
-    def test_override_needs_the_exact_code_and_name(self):
-        STATE['titles'] = {'titles': ['Made Up Quiz (ABC123)'], 'discovered_ids': 1}
-        for wrong in ({'confirm_session_code': 'ZZZ999'}, {'confirm_test_name': 'Other name'}, {'confirm_session_code': None}):
-            self.assertEqual(self.post(self.override(**wrong)).status_code, 400)
-        self.assertEqual(STATE['saves'], []); self.assertIsNone(self.state())
-        self.assertEqual(self.post(self.override()).status_code, 200); self.assertEqual(len(STATE['saves']), 1)
-    def test_could_not_check_also_needs_the_override(self):
-        for broken in (ValueError('Nigri login failed'), RuntimeError('boom'), {'titles': [], 'discovered_ids': 0}):
-            cr.JOBS.pop('rev1', None); self.add_review('rev1'); STATE['titles'] = broken; STATE['saves'] = []
-            out = self.post(); self.assertEqual(out.status_code, 409); self.assertEqual(out.get_json()['duplicate_check']['status'], 'could_not_check'); self.assertEqual(STATE['saves'], [])
-        self.assertEqual(self.post(self.override()).status_code, 200)
-    def test_override_for_a_one_boy_test_uses_the_test_name(self):
-        STATE['titles'] = {'titles': ['Made Up Quiz (ABC123)'], 'discovered_ids': 1}
-        name = 'TEST DELETE ME - Made Up Quiz (ABC123)'
-        self.assertEqual(self.post(self.override(only_student='Ann Nigri')).status_code, 400)             # the plain name is not the saved name
-        self.assertEqual(self.post(self.override(only_student='Ann Nigri', confirm_test_name=name)).status_code, 200)
+    def test_save_never_launches_the_nigri_duplicate_lookup(self):
+        with patch.object(stub, 'list_mark_titles', side_effect=AssertionError('duplicate browser must not run')) as lookup:
+            out = self.post({'only_student': 'Ann Nigri'})
+        self.assertEqual(out.status_code, 200)
+        lookup.assert_not_called()
+        self.assertEqual(len(STATE['saves']), 1)
+        self.assertEqual(STATE['saves'][0]['test_name'], 'TEST DELETE ME - Made Up Quiz (ABC123)')
+
     def test_pdf_problems_and_no_scores_can_never_be_overridden(self):
         STATE['titles'] = {'titles': ['Made Up Quiz (ABC123)'], 'discovered_ids': 1}
         self.add_review('rev1', [student('Ann', 9, pdf='missing'), student('Dee', 12)])
