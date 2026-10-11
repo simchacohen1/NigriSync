@@ -26,6 +26,10 @@ class FakePage:
 class FakeContext:
     def __init__(self, cookies):
         self._cookies = cookies
+        self.router = None
+    def route(self, selector, handler):
+        assert selector == '**/*'
+        self.router = handler
     def new_page(self):
         return FakePage()
     def cookies(self):
@@ -60,7 +64,7 @@ COOKIE = {'name': 'FAKE_SESSION', 'value': 'FAKE_PRIVATE_VALUE',
 
 
 class HybridProbeTests(unittest.TestCase):
-    def run_probe(self, html, cookies=None):
+    def run_probe(self, html, cookies=None, memory_mib=160):
         state = {'browser_closed': False, 'requests': [], 'signins': 0}
         browser = FakeBrowser(COOKIE and ([COOKIE] if cookies is None else cookies), state)
         fake_playwright = FakeSyncPlaywright(browser)
@@ -82,6 +86,10 @@ class HybridProbeTests(unittest.TestCase):
              patch('nigri_playwright.login', side_effect=fake_login), \
              patch('classtime_reader._chromium_args', return_value=[]), \
              patch('browser_runtime.log_memory'), \
+             patch('browser_runtime.memory_snapshot', return_value={
+                 'working_set': memory_mib * 1024 * 1024,
+                 'limit': 512 * 1024 * 1024,
+             }), \
              patch.object(probe, '_request', side_effect=fake_http), \
              patch.dict('os.environ', {'NIGRI_USERNAME': 'FAKE_LOGIN',
                                         'NIGRI_PASSWORD': 'FAKE_PASSWORD'}):
@@ -127,6 +135,33 @@ class HybridProbeTests(unittest.TestCase):
         result, state = self.run_probe(html)
         self.assertEqual(result['mark_entry_readonly']['entry_link_action_kind'], 'unknown')
         self.assertEqual(state['requests'], [('GET', probe.MARKS_URL)])
+
+    def test_insufficient_browser_startup_headroom_stops_before_login(self):
+        result, state = self.run_probe('<div>Create New Mark</div>', memory_mib=350)
+        self.assertEqual(result['status'], 'hybrid_insufficient_headroom')
+        self.assertTrue(state['browser_closed'])
+        self.assertEqual(state['requests'], [])
+        self.assertEqual(state['signins'], 0)
+        self.assertFalse(result['nigri_writes'])
+
+    def test_login_asset_blocker_keeps_scripts_and_forms(self):
+        class Request:
+            def __init__(self, resource_type):
+                self.resource_type = resource_type
+        class Route:
+            def __init__(self, kind):
+                self.request = Request(kind)
+                self.call = None
+            def abort(self): self.call = 'abort'
+            def continue_(self): self.call = 'continue'
+        for kind in ('image', 'font', 'media', 'texttrack'):
+            route = Route(kind)
+            probe._hybrid_login_router(route)
+            self.assertEqual(route.call, 'abort')
+        for kind in ('document', 'script', 'stylesheet', 'xhr', 'fetch'):
+            route = Route(kind)
+            probe._hybrid_login_router(route)
+            self.assertEqual(route.call, 'continue')
 
     def test_marks_unconfirmed_without_auth(self):
         html = '<form><input name="login"><input name="password"></form>'
