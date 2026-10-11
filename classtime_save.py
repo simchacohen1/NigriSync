@@ -101,16 +101,41 @@ def save_job(result, pdfs, body, topics):
     from nigri_playwright import run_marks_sync, SyncError
     planned = plan(result, pdfs, body, topics)
     packet, _, _ = sync.build_packet(planned['source'], pdfs, planned['options'], with_reports=True)
-    try:
-        done = run_marks_sync(class_section=result['class_section'], topic=planned['options']['topic'], test_name=planned['options']['test_name'],
-                              students=packet['students'], mark_type=planned['options']['type'], test_date=planned['options']['date'],
-                              description=planned['options']['description'], mark_all_done=planned['packet']['mark_all_done'],
-                               classtime_memory_saver=True)
-        return {'ok': True, 'test_id': done.get('test_id'), 'results': list(done.get('results') or [])}
-    except SyncError as error:
-        return {'ok': False, 'detail': str(error)[:300], 'results': list(getattr(error, 'partial_results', None) or [])}
-    except Exception:
-        return {'ok': False, 'detail': 'The save stopped with an error', 'results': []}
+    # The upload names are friendly, but the verified review PDFs have opaque
+    # storage names. Link them into a short-lived directory using the upload
+    # names. This uses constant Python memory and keeps individual PDFs on disk.
+    import shutil
+    import tempfile
+    from pathlib import Path
+    with tempfile.TemporaryDirectory(prefix='classtime-nigri-pdfs-') as attachment_dir:
+        used_filenames = set()
+        for student in packet['students']:
+            source_path = student.pop('report_path', None)
+            filename = student.get('report_filename')
+            if not source_path or not filename:
+                continue
+            original = Path(filename)
+            suffix = 2
+            while filename.casefold() in used_filenames:
+                filename = original.stem + ' (' + str(suffix) + ')' + original.suffix
+                suffix += 1
+            used_filenames.add(filename.casefold())
+            target_path = Path(attachment_dir) / filename
+            try:
+                os.link(source_path, target_path)
+            except OSError:
+                shutil.copyfile(source_path, target_path)
+            student['report_path'] = str(target_path)
+        try:
+            done = run_marks_sync(class_section=result['class_section'], topic=planned['options']['topic'], test_name=planned['options']['test_name'],
+                                  students=packet['students'], mark_type=planned['options']['type'], test_date=planned['options']['date'],
+                                  description=planned['options']['description'], mark_all_done=planned['packet']['mark_all_done'],
+                                  classtime_memory_saver=True)
+            return {'ok': True, 'test_id': done.get('test_id'), 'results': list(done.get('results') or [])}
+        except SyncError as error:
+            return {'ok': False, 'detail': str(error)[:300], 'results': list(getattr(error, 'partial_results', None) or [])}
+        except Exception:
+            return {'ok': False, 'detail': 'The save stopped with an error', 'results': []}
 
 
 def interpret(outcome, rows, one_boy):

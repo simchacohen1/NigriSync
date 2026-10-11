@@ -94,11 +94,13 @@ class PacketTests(unittest.TestCase):
         self.assertTrue(any('not verified' in b for b in blockers))
         _, _, blockers = cs.build_packet(self.result(student('Ben', None)), self.pdfs, OPTIONS)
         self.assertIn('No matched boy has a score', blockers)
-    def test_reports_are_encoded_only_when_asked(self):
+    def test_reports_stay_on_disk_for_saves_instead_of_base64_expansion(self):
         quiet, _, _ = cs.build_packet(self.result(student('Ann', 9, pdf_id='a')), self.pdfs, OPTIONS)
         self.assertNotIn('report_base64', quiet['students'][0])
         full, _, _ = cs.build_packet(self.result(student('Ann', 9, pdf_id='a')), self.pdfs, OPTIONS, with_reports=True)
-        self.assertTrue(full['students'][0]['report_base64']); self.assertTrue(full['students'][0]['report_filename'].endswith('.pdf'))
+        self.assertNotIn('report_base64', full['students'][0])
+        self.assertEqual(Path(full['students'][0]['report_path']).read_bytes(), Path(self.pdfs['a']).read_bytes())
+        self.assertTrue(full['students'][0]['report_filename'].endswith('.pdf'))
 
     def test_options_are_validated(self):
         r = self.result(); topics = {'Chumash': 1, 'Shoroshim': 2}
@@ -165,6 +167,7 @@ class RouteTests(unittest.TestCase):
             response = self.post(headers={'Authorization': 'Bearer t'})
         data = response.get_json()
         self.assertEqual(response.status_code, 200); self.assertTrue(data['dry_run']); self.assertFalse(data['nigri_writes']); self.assertFalse(data['can_save'])
+        self.assertFalse(data['real_save_enabled'])  # Production stays paused until separate owner authorization.
         self.assertEqual(data['duplicate_check']['status'], 'skipped'); self.assertEqual(CALLS['write'], 0); self.assertEqual(CALLS['list'], 0)
         self.assertEqual(data['counts']['will_save'], 1); self.assertNotIn('report_base64', json.dumps(data))
     def test_preview_does_not_contact_nigri_or_start_a_browser(self):
@@ -176,6 +179,39 @@ class RouteTests(unittest.TestCase):
         self.assertEqual(out['blockers'], [])
         self.assertFalse(out['nigri_writes'])
         lookup.assert_not_called()
+        browser.assert_not_called()
+
+    def test_preview_only_exposes_save_control_when_server_gate_is_open(self):
+        # Gate behavior only; this test never calls sync-save.
+        with patch.object(server, 'CLASSTIME_SAVES_PAUSED', False), \
+             patch.object(server, 'CLASSTIME_TEST_SAVE_STATE', 'armed'), self.owner():
+            response = self.post(headers={'Authorization': 'Bearer t'})
+        self.assertTrue(response.get_json()['real_save_enabled'])
+        self.assertEqual(CALLS['write'], 0)
+
+    def test_nigri_inspection_routes_use_http_or_are_closed_without_chromium(self):
+        client = server.app.test_client()
+        def run_http(target, *args, **kwargs):
+            kwargs.pop('_time_limit', None)
+            return target(*args, **kwargs)
+        with patch('classtime_auth.review_owner', return_value='uid1'), \
+             patch('browser_runtime.run_browser', side_effect=run_http), \
+             patch('nigri_http_probe.probe', return_value={'status': 'marks_listing_found', 'nigri_writes': False}) as http_probe:
+            response = client.post('/classtime/nigri-hybrid-probe')
+        self.assertEqual(response.status_code, 200)
+        http_probe.assert_called_once_with()
+
+        with patch('classtime_auth.review_owner', return_value='uid1'), \
+             patch('browser_runtime.run_browser', side_effect=run_http), \
+             patch('nigri_http_probe.probe', return_value={'blank_form': {'status': 'blank_form_found', 'nigri_writes': False}}) as http_probe:
+            response = client.post('/classtime/nigri-blank-mark-probe')
+        self.assertEqual(response.status_code, 200)
+        http_probe.assert_called_once_with(inspect_blank_form=True)
+
+        with patch('classtime_auth.review_owner', return_value='uid1'), \
+             patch('browser_runtime.run_browser', side_effect=AssertionError('must not launch Chromium')) as browser:
+            response = client.post('/classtime/nigri-topic-blocked-trace')
+        self.assertEqual(response.status_code, 410)
         browser.assert_not_called()
 
     def test_bad_input_missing_and_unready_reviews(self):
