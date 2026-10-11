@@ -228,8 +228,7 @@ _SAFE_NEW_MARK_QUERY_KEYS = frozenset({
     'section', 'subSection', 'spec', 'side', 'action', 'mode', 'task', 'view',
 })
 _SAFE_NEW_MARK_ACTIONS = frozenset({
-    'new', 'new_test', 'new_mark', 'new_test_form', 'create_test',
-    'add', 'add_test', 'create', 'form',
+    'new', 'new_test', 'new_mark', 'new_test_form', 'form',
 })
 
 
