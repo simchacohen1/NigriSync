@@ -82,6 +82,75 @@ class BlankMarkProbeTests(unittest.TestCase):
         self.assertEqual(result['status'], 'blank_form_found')
         self.assertEqual(len(session.calls), 1)
 
+    def test_real_blank_new_mark_pattern_opens_only_form_get(self):
+        href = ('/main/default_os_prog.asp?section=teachers&spec=tests'
+                '&testCoursTypeSelect=&testGradeSelect=&testID=0&testTopicSelect=')
+        result, session = self.run_probe(
+            '<a href="' + href.replace('&', '&amp;') + '">Create New Mark</a>')
+        self.assertEqual(result['status'], 'blank_form_found')
+        self.assertEqual(len(session.calls), 1)
+        method, target, kwargs = session.calls[0]
+        self.assertEqual(method, 'GET')
+        self.assertEqual(kwargs['allow_redirects'], False)
+        self.assertIn('testID=0', target)
+        self.assertTrue(result['no_submit_performed'])
+        self.assertFalse(result['nigri_writes'])
+
+    def test_all_other_variations_of_new_mark_params_are_blocked(self):
+        base = {
+            'section': 'teachers', 'spec': 'tests',
+            'testCoursTypeSelect': '', 'testGradeSelect': '',
+            'testID': '0', 'testTopicSelect': '',
+        }
+        cases = [
+            {'testID': '1'},
+            {'testID': '12'},
+            {'testID': ''},
+            {'testID': '00'},
+            {'testID': '-1'},
+            {'testID': 'new'},
+            {'testGradeSelect': '3'},
+            {'testTopicSelect': '1'},
+            {'testCoursTypeSelect': 'quiz'},
+            {'section': 'students'},
+            {'spec': 'homework'},
+        ]
+        for change in cases:
+            with self.subTest(change=change):
+                params = dict(base, **change)
+                href = '/main/default_os_prog.asp?' + '&'.join(
+                    k + '=' + v for k, v in params.items())
+                result, session = self.run_probe(
+                    '<a href="' + href.replace('&', '&amp;') + '">Create New Mark</a>')
+                self.assertEqual(session.calls, [])
+                self.assertTrue(result['status'].startswith('blank_form_link_'))
+                self.assertFalse(result['nigri_writes'])
+
+    def test_new_mark_link_extra_or_missing_parameters_never_open(self):
+        url = ('/main/default_os_prog.asp?section=teachers&spec=tests'
+               '&testCoursTypeSelect=&testGradeSelect=&testID=0&testTopicSelect=')
+        for href in [url + '&action=save',
+                     url + '&testID=0',
+                     url + '&testID=11',
+                     url.replace('&testTopicSelect=', ''),
+                     url.replace('spec=tests', 'subSection=tests'),
+                     url + '&unsafeToken=hello']:
+            with self.subTest(href=href):
+                result, session = self.run_probe(
+                    '<a href="' + href.replace('&', '&amp;') + '">Create New Mark</a>')
+                self.assertEqual(session.calls, [])
+                self.assertFalse(result['nigri_writes'])
+
+    def test_blank_new_mark_302_never_follows_redirect(self):
+        href = ('/main/default_os_prog.asp?section=teachers&spec=tests'
+                '&testCoursTypeSelect=&testGradeSelect=&testID=0&testTopicSelect=')
+        result, session = self.run_probe(
+            '<a href="' + href.replace('&', '&amp;') + '">Create New Mark</a>',
+            status=302)
+        self.assertEqual(result['status'], 'blank_form_get_not_200')
+        self.assertTrue(result['redirect_not_followed'])
+        self.assertEqual(len(session.calls), 1)
+
     def test_malformed_or_mutating_links_never_requested(self):
         urls = [
             '', '#new', 'javascript:submitMark()',

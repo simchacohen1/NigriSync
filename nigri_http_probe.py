@@ -249,6 +249,24 @@ def _safe_blank_mark_url(marks):
         if not pairs or len(pairs) > 9 or len(set(k for k, _ in pairs)) != len(pairs):
             return None, 'link_unrecognized'
         params = dict(pairs)
+        # Nigri's observed blank New Mark link contains exactly these six
+        # parameters. Permit this ONE form-opening GET only when all selector
+        # values are empty and testID is literally "0" (not an existing ID).
+        # Never broaden the normal allowlist to arbitrary IDs or actions.
+        observed_blank_keys = {
+            'section', 'spec',
+            'testCoursTypeSelect', 'testGradeSelect',
+            'testID', 'testTopicSelect',
+        }
+        if set(params) == observed_blank_keys:
+            if (params['section'] == 'teachers'
+                    and params['spec'] == 'tests'
+                    and params['testCoursTypeSelect'] == ''
+                    and params['testGradeSelect'] == ''
+                    and params['testID'] == '0'
+                    and params['testTopicSelect'] == ''):
+                return target, 'allowed_blank_new_mark_get'
+            return None, 'blank_new_mark_values_unexpected'
         if set(params) - _SAFE_NEW_MARK_QUERY_KEYS:
             return None, 'link_unrecognized'
         if params.get('section', '').lower() != 'teachers':
