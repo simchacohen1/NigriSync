@@ -78,6 +78,30 @@ def classtime_resource_status():
     return response
 
 
+# Browser-free Nigri page-structure probe. The only POST it can send to Nigri
+# is sign-in; it never submits the Create Mark!, Save!, or delete forms.
+@app.route("/classtime/nigri-http-probe", methods=["POST"])
+def classtime_nigri_http_probe():
+    from classtime_auth import review_owner
+    if not review_owner(allow_diagnostic=False):
+        return jsonify({"error": "unauthorized"}), 401
+    from browser_runtime import run_browser
+    from nigri_http_probe import probe
+    try:
+        result = run_browser(probe, _time_limit=90)
+    except Exception:
+        result = {"status": "probe_stopped", "nigri_writes": False}
+    response = jsonify(result)
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+# A previous test was stopped mid-save at the RAM cutoff. Until the new
+# HTTP save path has been verified and approved, block all Classtime writes
+# on the server, including calls bypassing the website's disabled controls.
+CLASSTIME_SAVES_PAUSED = True
+
+
 @app.route("/classtime/test-session", methods=["POST"])
 def classtime_test_session():
     import hmac
@@ -195,6 +219,8 @@ def classtime_sync_save(review_id):
     from classtime_auth import review_owner
     owner = review_owner(allow_diagnostic=False)
     if not owner: return jsonify({"error": "unauthorized"}), 401
+    if CLASSTIME_SAVES_PAUSED:
+        return jsonify({"saved": False, "error": "Classtime saving is paused during the browser-free Nigri investigation. Nothing was written."}), 423
     import re
     import classtime_save as save
     import classtime_sync
