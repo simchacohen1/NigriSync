@@ -92,6 +92,10 @@ class FakeGrade:
         return 1
     def select_option(self, value, **kwargs):
         assert value == '22590'
+        self.context.page.grade_selected = True
+        self.context.page.change_seen = True
+        if not self.context.simulate_requests:
+            return
         for method, kind, url in [
             ('POST', 'xhr', trace.BASE + '/secret/save?studentId=PRIVATE'),
             ('GET', 'fetch', trace.BASE + '/main/topics?class=22590'),
@@ -109,6 +113,18 @@ class FakeTopic:
 class FakePage:
     def __init__(self, context):
         self.context = context
+        self.grade_selected = False
+        self.change_seen = False
+    def evaluate(self, code, instrument=False):
+        assert 'select[name="testGradeID"]' in code
+        return {
+            'selected_b3_et': self.grade_selected,
+            'shoroshim_option_present': True,
+            'topic_option_count_capped': 3,
+            'change_event_seen': self.change_seen,
+            'topic_element_replaced': False,
+            'onchange_attribute_present': True,
+        }
     def goto(self, url, **kwargs):
         route = FakeRoute(FakeRequest('GET', 'document', url))
         self.context.router(route)
@@ -122,7 +138,7 @@ class FakePage:
             return FakeTopic()
         raise AssertionError(selector)
     def on(self, event, callback):
-        assert event == 'dialog'
+        assert event in ('dialog', 'pageerror')
     def wait_for_timeout(self, value):
         assert value in (250, 700)
 
@@ -130,6 +146,7 @@ class FakePage:
 class FakeContext:
     def __init__(self):
         self.router = None
+        self.simulate_requests = True
         self.page = FakePage(self)
     def route(self, selector, handler):
         assert selector == '**/*'
@@ -182,9 +199,47 @@ class FullBlockedTraceTests(unittest.TestCase):
         self.assertTrue(answer['post_blocked'])
         self.assertTrue(answer['attempted_xhr_or_fetch'])
         self.assertTrue(answer['all_change_requests_blocked'])
+        self.assertTrue(answer['change_event_observed'])
+        self.assertTrue(answer['b3_et_selected_after'])
+        self.assertTrue(answer['shoroshim_present_after_blocked_change'])
         self.assertFalse(answer['post_refresh_topic_verified'])
         self.assertFalse(answer['nigri_writes'])
         self.assertNotIn('PRIVATE', str(answer))
+
+    def test_no_requests_reported_as_inconclusive_even_if_change_fires(self):
+        b = FakeBrowser()
+        b.ctx.simulate_requests = False
+        with patch('playwright.sync_api.sync_playwright', return_value=FakePlaywright(b)), \
+             patch('classtime_reader._chromium_args', return_value=[]), \
+             patch('nigri_playwright.login', return_value=None), \
+             patch('browser_runtime.log_memory'), \
+             patch.object(trace, '_headroom_or_stop', return_value=True), \
+             patch.dict('os.environ', {'NIGRI_USERNAME': 'FAKE', 'NIGRI_PASSWORD': 'FAKE'}):
+            answer = trace.blocked_topic_refresh_trace()
+        self.assertTrue(b.closed)
+        self.assertEqual(answer['status'], 'no_class_change_requests_observed')
+        self.assertEqual(answer['attempted_methods'], [])
+        self.assertEqual(answer['attempted_request_count_capped'], 0)
+        self.assertTrue(answer['change_event_observed'])
+        self.assertTrue(answer['b3_et_selected_after'])
+        self.assertTrue(answer['shoroshim_present_after_blocked_change'])
+        self.assertFalse(answer['post_refresh_topic_verified'])
+        self.assertFalse(answer['nigri_writes'])
+
+    def test_preform_records_denied_script_categories_not_urls(self):
+        stats = {'blocked_scripts': 0, 'blocked_stylesheets': 0}
+        for kind, url in [
+            ('script', 'https://external.example/private.js'),
+            ('stylesheet', 'https://external.example/private.css'),
+            ('xhr', trace.BASE + '/main/grade-refresh?secret=PRIVATE')
+        ]:
+            route = FakeRoute(FakeRequest('GET', kind, url))
+            trace._preform_route(route, stats)
+            self.assertEqual(route.outcome, 'aborted')
+        self.assertEqual(stats['blocked_scripts'], 1)
+        self.assertEqual(stats['blocked_stylesheets'], 1)
+        self.assertNotIn('external.example', str(stats))
+        self.assertNotIn('PRIVATE', str(stats))
 
     def test_preflight_low_memory_closes_browser_without_selecting(self):
         b = FakeBrowser()
