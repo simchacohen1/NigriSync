@@ -5,6 +5,7 @@ GET the teacher home and existing marks listing. NEVER submit Create Mark!, Save
 upload. Never return passwords, cookies, hidden field values, HTML, or names.
 """
 import os
+import re
 from html.parser import HTMLParser
 from urllib.parse import urljoin, urlsplit, parse_qsl
 
@@ -269,8 +270,9 @@ def _safe_blank_mark_url(marks):
 def _blank_mark_link_diagnostics(marks):
     """Safe structural facts for a rejected Create New Mark link.
 
-    No GET/POST, and never disclose URL, query values, unknown key names,
-    credentials, session cookies or student information.
+    No GET/POST and never disclose URLs, query VALUES, unsafe-looking
+    parameter names, credentials, cookies or student information. Only
+    short, strictly filtered parameter identifiers can be returned.
     """
     links = [a for a in marks.links if 'create new mark' in a.get('label', '').lower()]
     if len(links) != 1:
@@ -290,6 +292,20 @@ def _blank_mark_link_diagnostics(marks):
         params = dict(pairs)
         keys = {k for k, _ in pairs}
         known = sorted(keys & _SAFE_NEW_MARK_QUERY_KEYS)
+        # These are query PARAMETER NAMES ONLY, never their values. Reject
+        # names that could contain PII/credentials or non-identifier text.
+        # Return at most 8 short names; all others remain count-only.
+        unknown_keys = keys - _SAFE_NEW_MARK_QUERY_KEYS
+        sensitive_words = (
+            'pass', 'secret', 'token', 'auth', 'cookie', 'session',
+            'email', 'user', 'student', 'person', 'phone', 'key',
+            'credential', 'login', 'pin', 'jwt', 'bearer', 'csrf',
+        )
+        safe_names = sorted(
+            k for k in unknown_keys
+            if re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{0,29}', k)
+            and not any(word in k.lower() for word in sensitive_words)
+        )[:8]
         action_flags = [k for k in ('action', 'mode', 'task', 'view')
                         if k in params and params[k].lower() not in _SAFE_NEW_MARK_ACTIONS]
         return {
@@ -298,7 +314,9 @@ def _blank_mark_link_diagnostics(marks):
             'has_fragment': bool(url.fragment),
             'query_key_count': min(len(pairs), 20),
             'recognized_query_keys': known,
-            'unknown_query_key_count': min(len(keys - _SAFE_NEW_MARK_QUERY_KEYS), 20),
+            'unknown_query_key_count': min(len(unknown_keys), 20),
+            'safe_unknown_parameter_names': safe_names,
+            'redacted_parameter_name_count': max(0, len(unknown_keys) - len(safe_names)),
             'has_duplicate_keys': len(pairs) != len(keys),
             'section_is_teachers': params.get('section', '').lower() == 'teachers',
             'tests_section_present': (params.get('spec', '').lower() == 'tests' or
