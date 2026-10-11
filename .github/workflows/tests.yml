@@ -16,5 +16,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: python -m pip install -r requirements.txt
-      - run: python -m unittest discover -s tests -v
+      - run: python -m pip install -r requirements.txt reportlab
+      # Some legacy tests monkey-patch sys.modules at import time. Isolate each
+      # test module so an earlier test cannot alter a later test's mocks.
+      - run: |
+          for file in tests/test_*.py; do
+            echo "::group::$(basename "$file")"
+            python -m unittest discover -s tests -p "$(basename "$file")" -v || exit 1
+            echo "::endgroup::"
+          done
