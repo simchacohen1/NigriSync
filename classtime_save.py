@@ -104,7 +104,8 @@ def save_job(result, pdfs, body, topics):
     try:
         done = run_marks_sync(class_section=result['class_section'], topic=planned['options']['topic'], test_name=planned['options']['test_name'],
                               students=packet['students'], mark_type=planned['options']['type'], test_date=planned['options']['date'],
-                              description=planned['options']['description'], mark_all_done=planned['packet']['mark_all_done'])
+                              description=planned['options']['description'], mark_all_done=planned['packet']['mark_all_done'],
+                               classtime_memory_saver=True)
         return {'ok': True, 'test_id': done.get('test_id'), 'results': list(done.get('results') or [])}
     except SyncError as error:
         return {'ok': False, 'detail': str(error)[:300], 'results': list(getattr(error, 'partial_results', None) or [])}
