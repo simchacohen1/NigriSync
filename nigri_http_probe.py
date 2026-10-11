@@ -267,6 +267,27 @@ def _safe_blank_mark_url(marks):
         return None, 'link_unrecognized'
 
 
+# Preapproved parameter names that appear in the authenticated New Mark link.
+# They are NEVER sufficient authorization to follow that link.
+_NEW_MARK_SELECTION_PARAMS = (
+    'testCoursTypeSelect', 'testGradeSelect', 'testID', 'testTopicSelect',
+)
+
+
+def _safe_mark_parameter_kind(values):
+    """Classify without returning or logging user data or URL values."""
+    if len(values) != 1:
+        return 'repeated_or_missing'
+    value = values[0]
+    if value == '':
+        return 'blank'
+    if value == '0':
+        return 'zero'
+    if value.isascii() and value.isdecimal() and len(value) <= 12:
+        return 'nonzero_number'
+    return 'other_redacted'
+
+
 def _blank_mark_link_diagnostics(marks):
     """Safe structural facts for a rejected Create New Mark link.
 
@@ -292,6 +313,15 @@ def _blank_mark_link_diagnostics(marks):
         params = dict(pairs)
         keys = {k for k, _ in pairs}
         known = sorted(keys & _SAFE_NEW_MARK_QUERY_KEYS)
+        # Group the original values locally; report only fixed categories.
+        grouped = {k: [v for x, v in pairs if x == k]
+                   for k in _NEW_MARK_SELECTION_PARAMS if k in keys}
+        parameter_kinds = {k: _safe_mark_parameter_kind(grouped[k])
+                           for k in _NEW_MARK_SELECTION_PARAMS if k in grouped}
+        # A nonzero testID could reference an existing mark; never inspect it
+        # as if it were a blank form.
+        test_id_kind = parameter_kinds.get('testID', 'missing')
+        may_reference_existing_mark = test_id_kind not in ('blank', 'zero')
         # These are query PARAMETER NAMES ONLY, never their values. Reject
         # names that could contain PII/credentials or non-identifier text.
         # Return at most 8 short names; all others remain count-only.
@@ -317,6 +347,8 @@ def _blank_mark_link_diagnostics(marks):
             'unknown_query_key_count': min(len(unknown_keys), 20),
             'safe_unknown_parameter_names': safe_names,
             'redacted_parameter_name_count': max(0, len(unknown_keys) - len(safe_names)),
+            'selection_parameter_kinds': parameter_kinds,
+            'test_id_may_reference_existing_mark': may_reference_existing_mark,
             'has_duplicate_keys': len(pairs) != len(keys),
             'section_is_teachers': params.get('section', '').lower() == 'teachers',
             'tests_section_present': (params.get('spec', '').lower() == 'tests' or
