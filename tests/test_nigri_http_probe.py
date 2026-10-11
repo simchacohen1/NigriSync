@@ -34,9 +34,11 @@ class FakeSession:
         self.redirect = redirect
 
     def prepare_request(self, request):
-        s = requests.Session()
-        s.cookies = self.cookies
-        return s.prepare_request(request)
+        prepared = request.prepare()
+        cookie_header = requests.cookies.get_cookie_header(self.cookies, prepared)
+        if cookie_header:
+            prepared.headers['Cookie'] = cookie_header
+        return prepared
 
     def __enter__(self): return self
     def __exit__(self, *_): return False
