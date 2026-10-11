@@ -41,6 +41,8 @@ class _Page(HTMLParser):
             self.forms.append(self._form)
         elif tag == 'input' and self._form is not None:
             self._form['inputs'].append({'name': a.get('name', ''), 'type': (a.get('type') or 'text').lower(), 'value': a.get('value', '')})
+        elif tag in ('select', 'textarea') and self._form is not None:
+            self._form['inputs'].append({'name': a.get('name', ''), 'type': tag, 'value': ''})
         elif tag == 'button' and self._form is not None and a.get('name'):
             self._form['inputs'].append({'name': a['name'], 'type': a.get('type', 'submit').lower(), 'value': a.get('value', '')})
         elif tag == 'a':
@@ -219,9 +221,94 @@ def _hybrid_login_router(route):
     return route.continue_()
 
 
-def probe_hybrid():
+# Only the already displayed "Create New Mark" link is eligible for the
+# new read-only form probe. Never guess a mark URL, follow a link with IDs,
+# or execute a GET with save/delete/submit/edit semantics.
+_SAFE_NEW_MARK_QUERY_KEYS = frozenset({
+    'section', 'subSection', 'spec', 'side', 'action', 'mode', 'task', 'view',
+})
+_SAFE_NEW_MARK_ACTIONS = frozenset({
+    'new', 'new_test', 'new_mark', 'new_test_form', 'create_test',
+    'add', 'add_test', 'create', 'form',
+})
+
+
+def _safe_blank_mark_url(marks):
+    links = [a for a in marks.links if 'create new mark' in a.get('label', '').lower()]
+    if len(links) != 1:
+        return None, 'link_missing_or_ambiguous'
+    href = links[0].get('href', '').strip()
+    if not href or href.startswith('#') or href.lower().startswith('javascript:'):
+        return None, 'link_not_a_get'
+    try:
+        target = _safe_url(urljoin(MARKS_URL, href))
+        bits = urlsplit(target)
+        if bits.path.lower() != '/main/default_os_prog.asp' or bits.fragment:
+            return None, 'link_unrecognized'
+        pairs = parse_qsl(bits.query, keep_blank_values=True)
+        if not pairs or len(pairs) > 9 or len(set(k for k, _ in pairs)) != len(pairs):
+            return None, 'link_unrecognized'
+        params = dict(pairs)
+        if set(params) - _SAFE_NEW_MARK_QUERY_KEYS:
+            return None, 'link_unrecognized'
+        if params.get('section', '').lower() != 'teachers':
+            return None, 'link_unrecognized'
+        if (params.get('spec', '').lower() != 'tests'
+                and params.get('subSection', '').lower() != 'tests'):
+            return None, 'link_unrecognized'
+        for key in ('action', 'mode', 'task', 'view'):
+            if key in params and params[key].lower() not in _SAFE_NEW_MARK_ACTIONS:
+                return None, 'link_unrecognized'
+        # A link back to the School Marks listing is NOT the New Mark form.
+        if target == MARKS_URL:
+            return None, 'link_is_listing'
+        return target, 'allowed'
+    except (ValueError, UnicodeError):
+        return None, 'link_unrecognized'
+
+
+def _probe_blank_mark_form(session, marks):
+    """One carefully validated GET, never a submit/POST. No redirects followed."""
+    target, why = _safe_blank_mark_url(marks)
+    if not target:
+        return {'status': 'blank_form_link_' + why, 'nigri_writes': False}
+    response = session.request('GET', target, timeout=(8, 20), allow_redirects=False)
+    if response.status_code != 200:
+        return {'status': 'blank_form_get_not_200',
+                'http_status': response.status_code,
+                'redirect_not_followed': response.status_code in (301, 302, 303, 307, 308),
+                'nigri_writes': False}
+    page = _page(response)
+    # Only approved field names; never expose field values, options, HTML,
+    # personal information, form actions, session cookies, or student records.
+    recognized = frozenset({
+        'testGradeID', 'testTopicID', 'testName', 'testDate',
+        'testDesc', 'testType', 'testCompleted',
+    })
+    inputs = [i for f in page.forms for i in f['inputs']]
+    names = sorted({i['name'] for i in inputs
+                    if i['name'] in recognized or i['name'].startswith('testType_') and
+                    len(i['name']) < 35 and i['name'][9:].isalnum()})
+    has_blank = {'testGradeID', 'testName'}.issubset(names)
+    create_button = any(i['type'] in ('submit', 'image', 'button')
+                        and i.get('value', '').strip() == 'Create Mark!' for i in inputs)
+    return {
+        'status': 'blank_form_found' if has_blank else 'blank_form_unconfirmed',
+        'form_detected': has_blank,
+        'field_names': names[:30],
+        'form_count': len(page.forms),
+        'create_button_present': create_button,
+        'only_one_extra_get': True,
+        'no_submit_performed': True,
+        'nigri_writes': False,
+    }
+
+
+def probe_hybrid(*, inspect_blank_form=False):
     """Read-only login through Chromium, then CLOSE it and GET marks over HTTP.
 
+    When inspect_blank_form is True, follow ONLY an allowlisted GET from
+    Nigri's authenticated Create New Mark link; never submit a form.
     No Create Mark!, Save!, upload or delete requests. Cookies stay in memory
     only; returned results contain no credentials, cookie details or student data.
     """
@@ -292,7 +379,7 @@ def probe_hybrid():
                 {'login', 'password'}.issubset({i['name'] for i in f['inputs']})
                 for f in marks.forms
             )
-            return {
+            result = {
                 'status': 'hybrid_marks_found' if has_marks else 'hybrid_marks_unconfirmed',
                 'marks_controls_found': has_marks,
                 'login_form_on_marks': has_login_form,
@@ -302,6 +389,12 @@ def probe_hybrid():
                 'mark_entry_readonly': _mark_entry_readonly_summary(marks),
                 'nigri_writes': False,
             }
+            if inspect_blank_form:
+                if not has_marks:
+                    result['blank_form'] = {'status': 'blank_form_marks_unconfirmed', 'nigri_writes': False}
+                else:
+                    result['blank_form'] = _probe_blank_mark_form(session, marks)
+            return result
     except Exception:
         # Never return exception text (could include sensitive URLs/cookies).
         return {'status': 'hybrid_' + stage + '_stopped', 'nigri_writes': False}
