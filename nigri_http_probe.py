@@ -266,11 +266,56 @@ def _safe_blank_mark_url(marks):
         return None, 'link_unrecognized'
 
 
+def _blank_mark_link_diagnostics(marks):
+    """Safe structural facts for a rejected Create New Mark link.
+
+    No GET/POST, and never disclose URL, query values, unknown key names,
+    credentials, session cookies or student information.
+    """
+    links = [a for a in marks.links if 'create new mark' in a.get('label', '').lower()]
+    if len(links) != 1:
+        return {'link_count': 'none' if not links else 'multiple',
+                'no_navigation': True}
+    href = links[0].get('href', '').strip()
+    if href.lower().startswith('javascript:'):
+        return {'link_kind': 'javascript', 'no_navigation': True}
+    if href.startswith('#'):
+        return {'link_kind': 'fragment', 'no_navigation': True}
+    if not href:
+        return {'link_kind': 'empty', 'no_navigation': True}
+    try:
+        target = _safe_url(urljoin(MARKS_URL, href))
+        url = urlsplit(target)
+        pairs = parse_qsl(url.query, keep_blank_values=True)
+        params = dict(pairs)
+        keys = {k for k, _ in pairs}
+        known = sorted(keys & _SAFE_NEW_MARK_QUERY_KEYS)
+        action_flags = [k for k in ('action', 'mode', 'task', 'view')
+                        if k in params and params[k].lower() not in _SAFE_NEW_MARK_ACTIONS]
+        return {
+            'link_kind': 'same_host_https',
+            'expected_asp_path': url.path.lower() == '/main/default_os_prog.asp',
+            'has_fragment': bool(url.fragment),
+            'query_key_count': min(len(pairs), 20),
+            'recognized_query_keys': known,
+            'unknown_query_key_count': min(len(keys - _SAFE_NEW_MARK_QUERY_KEYS), 20),
+            'has_duplicate_keys': len(pairs) != len(keys),
+            'section_is_teachers': params.get('section', '').lower() == 'teachers',
+            'tests_section_present': (params.get('spec', '').lower() == 'tests' or
+                                      params.get('subSection', '').lower() == 'tests'),
+            'unsupported_action_key_count': len(action_flags),
+            'is_marks_listing': target == MARKS_URL,
+            'no_navigation': True,
+        }
+    except (ValueError, UnicodeError):
+        return {'link_kind': 'other_host_or_invalid', 'no_navigation': True}
+
+
 def _probe_blank_mark_form(session, marks):
     """One carefully validated GET, never a submit/POST. No redirects followed."""
     target, why = _safe_blank_mark_url(marks)
     if not target:
-        return {'status': 'blank_form_link_' + why, 'nigri_writes': False}
+        return {'status': 'blank_form_link_' + why, 'link_diagnostics': _blank_mark_link_diagnostics(marks), 'nigri_writes': False}
     response = session.request('GET', target, timeout=(8, 20), allow_redirects=False)
     if response.status_code != 200:
         return {'status': 'blank_form_get_not_200',

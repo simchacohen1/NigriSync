@@ -103,6 +103,32 @@ class BlankMarkProbeTests(unittest.TestCase):
                 self.assertEqual(session.calls, [])
                 self.assertFalse(result['nigri_writes'])
 
+    def test_rejected_link_reports_only_safe_shape(self):
+        unsafe = ('/main/other.asp?section=teachers&spec=tests&token=PRIVATE_TOKEN'
+                  '&action=save&testID=813')
+        listing = '<a href="' + unsafe.replace('&', '&amp;') + '">Create New Mark</a>'
+        result, session = self.run_probe(listing)
+        self.assertEqual(session.calls, [])
+        diag = result['link_diagnostics']
+        self.assertEqual(diag['link_kind'], 'same_host_https')
+        self.assertFalse(diag['expected_asp_path'])
+        self.assertEqual(diag['recognized_query_keys'], ['action', 'section', 'spec'])
+        self.assertEqual(diag['unknown_query_key_count'], 2)
+        self.assertEqual(diag['unsupported_action_key_count'], 1)
+        self.assertTrue(diag['no_navigation'])
+        self.assertNotIn('PRIVATE_TOKEN', str(result))
+        self.assertNotIn('813', str(result))
+        self.assertNotIn('token', str(result))
+        self.assertNotIn('/main/other.asp', str(result))
+
+    def test_link_with_no_query_keys_does_not_expose_path(self):
+        result, session = self.run_probe(
+            '<a href="/main/nigri-new-mark.asp">Create New Mark</a>')
+        self.assertEqual(session.calls, [])
+        self.assertEqual(result['link_diagnostics']['recognized_query_keys'], [])
+        self.assertFalse(result['link_diagnostics']['expected_asp_path'])
+        self.assertNotIn('nigri-new-mark.asp', str(result))
+
     def test_multiple_create_links_are_rejected(self):
         result, session = self.run_probe(LISTING + LISTING)
         self.assertEqual(result['status'], 'blank_form_link_link_missing_or_ambiguous')
