@@ -56,6 +56,17 @@ def release_browser_slot(error):
 SYNC_API_KEY = os.environ.get("SYNC_API_KEY")
 
 
+def nigri_authorized(allow_query_key=False):
+    """A Nigri route is allowed if EITHER the old shared key matches (exactly as before) OR the request carries the
+    website owner's verified Google sign-in (Authorization: Bearer <token>). The Classtime diagnostic token does not count here."""
+    import hmac
+    provided = request.headers.get("X-Sync-Key") or (request.args.get("key") if allow_query_key else None)
+    if SYNC_API_KEY and provided and hmac.compare_digest(provided.encode("utf-8"), SYNC_API_KEY.encode("utf-8")):
+        return True
+    from classtime_auth import review_owner
+    return bool(review_owner(allow_diagnostic=False))
+
+
 # Read-only Classtime diagnostic, separate from every Nigri write route.
 @app.route("/classtime/resources", methods=["GET"])
 def classtime_resource_status():
@@ -177,9 +188,7 @@ def health():
 @app.route("/sync-points", methods=["POST"])
 def sync_points():
     # --- auth check ---
-    provided_key = request.headers.get("X-Sync-Key")
-    if not SYNC_API_KEY or provided_key != SYNC_API_KEY:
-        return jsonify({"error": "unauthorized"}), 401
+    if not nigri_authorized(): return jsonify({"error": "unauthorized"}), 401
 
     body = request.get_json(force=True, silent=True) or {}
 
@@ -212,9 +221,7 @@ def sync_points():
 @app.route("/debug-page", methods=["POST"])
 def debug_page():
     # --- auth check ---
-    provided_key = request.headers.get("X-Sync-Key")
-    if not SYNC_API_KEY or provided_key != SYNC_API_KEY:
-        return jsonify({"error": "unauthorized"}), 401
+    if not nigri_authorized(): return jsonify({"error": "unauthorized"}), 401
 
     body = request.get_json(force=True, silent=True) or {}
     class_section = body.get("class_section")
@@ -234,9 +241,7 @@ def debug_page():
 @app.route("/debug-points", methods=["POST"])
 def debug_points():
     # --- auth check ---
-    provided_key = request.headers.get("X-Sync-Key")
-    if not SYNC_API_KEY or provided_key != SYNC_API_KEY:
-        return jsonify({"error": "unauthorized"}), 401
+    if not nigri_authorized(): return jsonify({"error": "unauthorized"}), 401
 
     body = request.get_json(force=True, silent=True) or {}
     class_section = body.get("class_section")
@@ -256,9 +261,7 @@ def debug_points():
 @app.route("/debug-rewards", methods=["POST"])
 def debug_rewards():
     # --- auth check ---
-    provided_key = request.headers.get("X-Sync-Key")
-    if not SYNC_API_KEY or provided_key != SYNC_API_KEY:
-        return jsonify({"error": "unauthorized"}), 401
+    if not nigri_authorized(): return jsonify({"error": "unauthorized"}), 401
 
     body = request.get_json(force=True, silent=True) or {}
     student_name = body.get("student_name")  # optional
@@ -277,9 +280,7 @@ def debug_marks():
     # URL into a browser's address bar -- no terminal/curl needed. The key
     # goes in the URL itself (?key=...) for GET, or the X-Sync-Key header
     # for POST (used by the other debug endpoints / the real sync later).
-    provided_key = request.headers.get("X-Sync-Key") or request.args.get("key")
-    if not SYNC_API_KEY or provided_key != SYNC_API_KEY:
-        return jsonify({"error": "unauthorized"}), 401
+    if not nigri_authorized(allow_query_key=True): return jsonify({"error": "unauthorized"}), 401
 
     if request.method == "POST":
         body = request.get_json(force=True, silent=True) or {}
@@ -311,9 +312,7 @@ def debug_marks_create():
     # WARNING: unlike every other /debug-* endpoint, this one writes a
     # real (obviously-fake) mark to the live Nigri site, then deletes it
     # again by default. See debug_marks_create_and_view()'s docstring.
-    provided_key = request.headers.get("X-Sync-Key") or request.args.get("key")
-    if not SYNC_API_KEY or provided_key != SYNC_API_KEY:
-        return jsonify({"error": "unauthorized"}), 401
+    if not nigri_authorized(allow_query_key=True): return jsonify({"error": "unauthorized"}), 401
 
     if request.method == "POST":
         body = request.get_json(force=True, silent=True) or {}
@@ -358,9 +357,7 @@ def sync_marks():
     # This is the real, production endpoint -- it creates and saves a
     # real mark on the live Nigri site (it does NOT auto-delete). Use
     # /debug-marks-full first to test the whole flow safely.
-    provided_key = request.headers.get("X-Sync-Key")
-    if not SYNC_API_KEY or provided_key != SYNC_API_KEY:
-        return jsonify({"error": "unauthorized"}), 401
+    if not nigri_authorized(): return jsonify({"error": "unauthorized"}), 401
 
     body = request.get_json(force=True, silent=True) or {}
 
@@ -423,9 +420,7 @@ def read_marks_endpoint():
 
     Omit class/class_section to return both B3 ET and B3 WT.
     """
-    provided_key = request.headers.get("X-Sync-Key") or request.args.get("key")
-    if not SYNC_API_KEY or provided_key != SYNC_API_KEY:
-        return jsonify({"error": "unauthorized"}), 401
+    if not nigri_authorized(allow_query_key=True): return jsonify({"error": "unauthorized"}), 401
 
     if request.method == "POST":
         body = request.get_json(force=True, silent=True) or {}
@@ -455,9 +450,7 @@ def read_attendance_endpoint():
     Authenticated READ-ONLY endpoint for Nigri Attendance History.
     No attendance checkboxes or Save controls are touched.
     """
-    provided_key = request.headers.get("X-Sync-Key") or request.args.get("key")
-    if not SYNC_API_KEY or provided_key != SYNC_API_KEY:
-        return jsonify({"error": "unauthorized"}), 401
+    if not nigri_authorized(allow_query_key=True): return jsonify({"error": "unauthorized"}), 401
 
     try:
         result = read_attendance()
@@ -475,9 +468,7 @@ def debug_marks_full():
     # Save!, exercising the exact same code path as the real
     # /sync-marks endpoint above. Deletes the test mark afterward by
     # default, same safety net as /debug-marks-create.
-    provided_key = request.headers.get("X-Sync-Key") or request.args.get("key")
-    if not SYNC_API_KEY or provided_key != SYNC_API_KEY:
-        return jsonify({"error": "unauthorized"}), 401
+    if not nigri_authorized(allow_query_key=True): return jsonify({"error": "unauthorized"}), 401
 
     if request.method == "POST":
         body = request.get_json(force=True, silent=True) or {}

@@ -3,12 +3,12 @@ import os
 import hmac
 from flask import request
 
-def review_owner():
+def review_owner(allow_diagnostic=True):
     header = request.headers.get('Authorization', '')
     if not header.startswith('Bearer '): return None
     token = header[7:]
     diagnostic = os.environ.get('CLASSTIME_TEST_TOKEN', '')
-    if diagnostic and hmac.compare_digest(token, diagnostic): return 'backend-diagnostic'
+    if allow_diagnostic and diagnostic and hmac.compare_digest(token, diagnostic): return 'backend-diagnostic'
     try:
         from google.oauth2 import id_token
         from google.auth.transport.requests import Request
