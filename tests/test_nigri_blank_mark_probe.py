@@ -133,6 +133,64 @@ class BlankMarkProbeTests(unittest.TestCase):
         self.assertTrue(summary['form_not_submitted'])
         self.assertEqual(len(session.calls), 1)
 
+    def test_offline_header_serialization_from_readonly_form(self):
+        from unittest.mock import patch
+        import requests
+        with patch.object(requests.sessions.Session, 'request',
+                          side_effect=AssertionError('NO NETWORK')),\
+             patch.object(requests.sessions.Session, 'send',
+                          side_effect=AssertionError('NO NETWORK')):
+            result, session = self.run_probe()
+        rehearsal = result['offline_header_rehearsal']
+        self.assertEqual(rehearsal['status'], 'offline_header_shape_prepared')
+        self.assertEqual(rehearsal['mock_header_field_count'], 6)
+        self.assertTrue(rehearsal['all_six_expected_fields_present'])
+        self.assertTrue(rehearsal['mock_request_prepared'])
+        self.assertFalse(rehearsal['mock_request_sent'])
+        self.assertFalse(rehearsal['nigri_post_attempted'])
+        self.assertFalse(rehearsal['real_post_acceptance_verified'])
+        self.assertTrue(rehearsal['topic_ajax_dependencies_unverified'])
+        self.assertFalse(result['nigri_writes'])
+        # FakeSession is the only transport for the single approved GET.
+        self.assertEqual(len(session.calls), 1)
+        self.assertEqual(session.calls[0][0], 'GET')
+
+    def test_offline_header_mock_ignores_untrusted_action_and_secret_values(self):
+        result, session = self.run_probe(html=(
+            '<form method="post" action="/main/default_os_prog.asp?'
+            'section=teachers&amp;spec=tests&amp;token=SENSITIVE">'
+            '<input name="testName" value="LEAK_ME">'
+            '<input name="testGradeID"><input name="testTopicID">'
+            '<input name="testType"><input name="testDate">'
+            '<input name="testDesc">'
+            '<input type="hidden" name="SENSITIVE_HIDDEN" value="TOPSECRET">'
+            '<input type="submit" value="Create Mark!"></form>'
+        ))
+        rehearsal = result['offline_header_rehearsal']
+        self.assertEqual(rehearsal['status'], 'offline_header_shape_prepared')
+        self.assertTrue(rehearsal['hidden_controls_require_future_review'])
+        self.assertTrue(rehearsal['topic_ajax_dependencies_unverified'])
+        self.assertFalse(rehearsal['real_post_acceptance_verified'])
+        for secret in ('LEAK_ME','SENSITIVE','TOPSECRET','SENSITIVE_HIDDEN'):
+            self.assertNotIn(secret, str(rehearsal))
+        self.assertEqual(len(session.calls), 1)
+
+    def test_offline_header_refuses_incomplete_or_untrusted_form(self):
+        htmls = (
+            '<form method="get" action="/main/default_os_prog.asp"><input name="testGradeID"><input name="testName"></form>',
+            '<form method="post" action="https://other.invalid/create"><input name="testGradeID"><input name="testName"></form>',
+            '<form method="post" action="/main/default_os_prog.asp"><input name="testGradeID"><input name="testName"></form>',
+            '<form method="post" action="/main/default_os_prog.asp"><input name="testGradeID"><input name="testName"><input name="testTopicID"><input name="testType"><input name="testDate"><input name="testDesc"></form>',
+        )
+        for html in htmls:
+            with self.subTest(html=html[:50]):
+                result, session = self.run_probe(html=html)
+                rehearsal = result['offline_header_rehearsal']
+                self.assertFalse(rehearsal['mock_request_prepared'])
+                self.assertFalse(rehearsal['nigri_post_attempted'])
+                self.assertFalse(rehearsal['real_post_acceptance_verified'])
+                self.assertEqual(len(session.calls), 1)
+
     def test_redirect_is_never_followed(self):
         result, session = self.run_probe(status=302)
         self.assertEqual(result['status'], 'blank_form_get_not_200')
