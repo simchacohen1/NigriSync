@@ -1,7 +1,7 @@
 """Browser-free, read-only Nigri connectivity probe for the owner's Classtime page.
 
 Permitted network operations: GET login page, POST *only* the sign-in form,
-GET the existing marks listing. NEVER submit Create Mark!, Save!, delete or
+GET the teacher home and existing marks listing. NEVER submit Create Mark!, Save!, delete or
 upload. Never return passwords, cookies, hidden field values, HTML, or names.
 """
 import os
@@ -32,6 +32,7 @@ class _Page(HTMLParser):
         self.links = []
         self._form = None
         self._a = None
+        self.has_create_text = False
 
     def handle_starttag(self, tag, attrs):
         a = dict(attrs)
@@ -47,6 +48,8 @@ class _Page(HTMLParser):
             self.links.append(self._a)
 
     def handle_data(self, data):
+        if 'create new mark' in data.lower():
+            self.has_create_text = True
         if self._a is not None:
             self._a['label'] += data[:200]
 
@@ -65,11 +68,13 @@ def _page(response):
     return parsed
 
 
-def _request(session, method, url, *, data=None):
+def _request(session, method, url, *, data=None, trace=None):
     """Follow redirects only as same-host GETs; never replay a sign-in POST."""
     url = _safe_url(url)
     for _ in range(6):
         response = session.request(method, url, data=data, timeout=(8, 20), allow_redirects=False)
+        if trace is not None:
+            trace.append(response.status_code)  # Status codes only; never URLs, cookies or page data.
         if response.status_code in (301, 302, 303):
             location = response.headers.get('Location')
             if not location:
@@ -110,19 +115,40 @@ def probe():
             fields[image_buttons[0]['name'] + '.x'] = '15'
             fields[image_buttons[0]['name'] + '.y'] = '15'
         fields.update(login=username, password=password)
-        login_response = _request(session, 'POST', action, data=fields)  # SIGN-IN ONLY
+        post_trace, home_trace, marks_trace = [], [], []
+        login_response = _request(session, 'POST', action, data=fields, trace=post_trace)  # SIGN-IN ONLY
         login_after_post = _page(login_response)
         login_field_names = {'login', 'password'}
-        post_still_login = any(login_field_names.issubset({i['name'] for i in f['inputs']}) for f in login_after_post.forms)
-        marks = _page(_request(session, 'GET', MARKS_URL))
-        if any(login_field_names.issubset({i['name'] for i in f['inputs']}) for f in marks.forms):
-            return {'status': 'login_not_accepted',
-                    'login_form_returned_after_post': post_still_login,
-                    'image_button_submitted': len(image_buttons) == 1,
-                    'nigri_writes': False}
+        def has_login(page):
+            return any(login_field_names.issubset({i['name'] for i in f['inputs']}) for f in page.forms)
+        post_still_login = has_login(login_after_post)
+        cookies_after_post = len(session.cookies)  # Count only; never expose cookie names or values.
+        home = _page(_request(session, 'GET', LOGIN_URL, trace=home_trace))  # Read-only teacher home.
+        home_still_login = has_login(home)
+        # Check whether requests would attach the existing session cookie to the marks GET.
+        marks_has_cookie = bool(session.prepare_request(requests.Request('GET', MARKS_URL)).headers.get('Cookie'))
+        marks = _page(_request(session, 'GET', MARKS_URL, trace=marks_trace))
+        marks_still_login = has_login(marks)
         create = [a for a in marks.links if 'create new mark' in a['label'].lower()]
         field_names = {i['name'] for f in marks.forms for i in f['inputs']}
-        recognizable = bool(create or {'testGradeID', 'testName', 'testDate'} & field_names)
+        recognizable = bool(create or marks.has_create_text or {'testGradeID', 'testName', 'testDate'} & field_names)
+        diagnostics = {
+            'login_form_returned_after_post': post_still_login,
+            'login_form_at_teacher_home': home_still_login,
+            'login_form_at_marks': marks_still_login,
+            'image_button_submitted': len(image_buttons) == 1,
+            'cookies_after_login_count': cookies_after_post,
+            'cookies_sent_to_marks': marks_has_cookie,
+            'login_post_redirect_count': len(post_trace) - 1,
+            'teacher_home_redirect_count': len(home_trace) - 1,
+            'marks_redirect_count': len(marks_trace) - 1,
+            'marks_create_text_found': marks.has_create_text,
+            'nigri_writes': False,
+        }
+        # A login form in a shared header is not enough to prove login failure if
+        # the page also contains the authenticated marks controls.
+        if marks_still_login and not recognizable:
+            return {'status': 'login_not_accepted', **diagnostics}
         kind = 'none'
         keys = []
         if create:
@@ -132,6 +158,6 @@ def probe():
                 target = _safe_url(urljoin(MARKS_URL, href))
                 keys = sorted(set(k for k, _ in parse_qsl(urlsplit(target).query)))[:16]
         return {'status': 'marks_listing_found' if recognizable else 'marks_page_unconfirmed',
-                'http_login_succeeded': recognizable, 'create_link_found': bool(create),
+                **diagnostics, 'http_login_succeeded': recognizable, 'create_link_found': bool(create),
                 'create_link_kind': kind, 'create_link_query_keys': keys,
                 'form_count': len(marks.forms), 'nigri_writes': False}
