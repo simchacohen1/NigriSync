@@ -278,6 +278,84 @@ class BlankMarkProbeTests(unittest.TestCase):
         self.assertEqual(len(session.calls), 1)
         self.assertNotIn('REAL_STUDENT_NAME_HIDDEN', str(result))
 
+    def test_refresh_preflight_detects_grade_onchange_without_selection(self):
+        html = (
+            '<form method="post" action="/main/default_os_prog.asp">'
+            '<select name="testGradeID" onchange="refreshNigriTopics(this.value)">'
+            '<option value="22590">B3 ET</option></select>'
+            '<select name="testTopicID"><option value="142">Shoroshim</option></select>'
+            '<input name="testName"><input name="testDate"><input name="testType">'
+            '<textarea name="testDesc"></textarea><input type="submit" value="Create Mark!">'
+            '</form>'
+            '<script src="/main/assets/private-student-secret.js"></script>'
+        )
+        result, session = self.run_probe(html=html)
+        t = result['topic_refresh_preflight']
+        self.assertEqual(t['status'], 'trigger_inspected')
+        self.assertEqual(t['class_change_handler_kind'], 'named_or_inline_handler')
+        self.assertTrue(t['inline_change_handler_present'])
+        self.assertEqual(t['external_script_count'], 1)
+        self.assertFalse(t['post_refresh_verified'])
+        self.assertFalse(t['class_selection_performed'])
+        self.assertFalse(t['ajax_request_performed'])
+        self.assertFalse(t['topic_ajax_http_method_verified'])
+        self.assertEqual(t['network_requests_sent'], 0)
+        self.assertEqual([x[0] for x in session.calls], ['GET'])
+        self.assertNotIn('refreshNigriTopics', str(t))
+        self.assertNotIn('private-student-secret', str(result))
+
+    def test_possible_form_post_is_not_attempted(self):
+        html = (
+            '<form method="post" action="/main/default_os_prog.asp">'
+            '<select name="testGradeID" onchange="this.form.submit()">'
+            '<option value="22590">B3 ET</option></select>'
+            '<select name="testTopicID"><option value="142">Shoroshim</option></select>'
+            '<input name="testName"><input name="testType"><input name="testDate">'
+            '<input name="testDesc"><input type="submit" value="Create Mark!">'
+            '</form>')
+        result, session = self.run_probe(html=html)
+        p = result['topic_refresh_preflight']
+        self.assertEqual(p['class_change_handler_kind'], 'possible_form_submit')
+        self.assertEqual(p['network_requests_sent'], 0)
+        self.assertFalse(p['post_refresh_verified'])
+        self.assertFalse(result['nigri_writes'])
+        self.assertEqual(len(session.calls), 1)
+
+    def test_inline_ajax_indications_are_not_executed_or_disclosed(self):
+        html = (
+            '<form method="post" action="/main/default_os_prog.asp">'
+            '<select name="testGradeID"><option value="22590">B3 ET</option></select>'
+            '<select name="testTopicID"><option value="142">Shoroshim</option></select>'
+            '<input name="testName"></form>'
+            '<script>function SECRET_STUDENT_FUNCTION(){'
+            'var testGradeID="PRIVATE_GRADE";'
+            'var testTopicID="PRIVATE_TOPIC";'
+            'fetch("/private/student/email");'
+            '$.post("/private/secret");'
+            '}</script>'
+        )
+        result, session = self.run_probe(html=html)
+        p = result['topic_refresh_preflight']
+        self.assertEqual(p['class_change_handler_kind'], 'script_ajax_possible')
+        self.assertTrue(p['inline_script_ajax_keyword_found'])
+        self.assertTrue(p['inline_script_post_keyword_found'])
+        self.assertTrue(p['inline_script_grade_reference_found'])
+        self.assertTrue(p['inline_script_topic_reference_found'])
+        self.assertFalse(p['topic_ajax_http_method_verified'])
+        self.assertEqual(p['network_requests_sent'], 0)
+        self.assertEqual(len(session.calls), 1)
+        for secret in ('SECRET_STUDENT_FUNCTION', 'PRIVATE_GRADE', 'PRIVATE_TOPIC', 'private/secret', 'private/student/email'):
+            self.assertNotIn(secret, str(result))
+
+    def test_static_form_only_never_claims_refreshed_topic(self):
+        result, session = self.run_probe()
+        p = result['topic_refresh_preflight']
+        self.assertFalse(p['post_refresh_verified'])
+        self.assertFalse(p['class_selection_performed'])
+        self.assertFalse(p['ajax_request_performed'])
+        self.assertEqual(p['network_requests_sent'], 0)
+        self.assertEqual(len(session.calls), 1)
+
     def test_redirect_is_never_followed(self):
         result, session = self.run_probe(status=302)
         self.assertEqual(result['status'], 'blank_form_get_not_200')
