@@ -55,13 +55,19 @@ def _safe_static_asset(request):
     return False
 
 
-def _preform_route(route):
+def _preform_route(route, stats=None):
     request = route.request
     # Login is finished before this router is installed. Only the known
     # blank form GET and harmless same-host static files may leave Chromium.
     if (request.method == 'GET' and _is_blank_form_get(request.url)) or _safe_static_asset(request):
         route.continue_()
     else:
+        if stats is not None:
+            kind = request.resource_type
+            if kind == 'script':
+                stats['blocked_scripts'] = min(100, stats.get('blocked_scripts', 0) + 1)
+            elif kind == 'stylesheet':
+                stats['blocked_stylesheets'] = min(100, stats.get('blocked_stylesheets', 0) + 1)
         route.abort()
 
 
@@ -86,6 +92,42 @@ def _headroom_or_stop():
     if s and s['working_set'] + 85 * MIB >= s['limit'] * STOP_PERCENT / 100:
         return False
     return True
+
+
+
+
+def _form_snapshot(page, *, instrument=False):
+    """Tiny DOM-only snapshot; never export form HTML, options, names or URLs."""
+    js = """(instrument) => {
+      const grade = document.querySelector('select[name="testGradeID"]');
+      const topic = document.querySelector('select[name="testTopicID"]');
+      if (!grade || !topic) return null;
+      if (instrument) {
+        const state = {changeCount:0, oldTopic:topic};
+        grade.addEventListener('change', () => {state.changeCount++}, true);
+        window.__fttBlockedTraceState = state;
+      }
+      const state = window.__fttBlockedTraceState;
+      const hasShoroshim = Array.from(topic.options).some(o => o.value === '142');
+      return {
+        selected_b3_et: grade.value === '22590',
+        shoroshim_option_present: hasShoroshim,
+        topic_option_count_capped: Math.min(topic.options.length, 100),
+        change_event_seen: !!(state && state.changeCount > 0),
+        topic_element_replaced: !!(state && state.oldTopic !== topic),
+        onchange_attribute_present: !!grade.getAttribute('onchange')
+      };
+    }"""
+    observed = page.evaluate(js, instrument)
+    if not isinstance(observed, dict):
+        return None
+    keys = ('selected_b3_et', 'shoroshim_option_present',
+            'topic_option_count_capped', 'change_event_seen',
+            'topic_element_replaced', 'onchange_attribute_present')
+    # Coerce the report to a fixed allowlist, never copy arbitrary page data.
+    return {k: (min(100, max(0, int(observed[k])))
+                if k == 'topic_option_count_capped' else observed[k] is True)
+            for k in keys if k in observed}
 
 
 def blocked_topic_refresh_trace():
@@ -122,7 +164,13 @@ def blocked_topic_refresh_trace():
                     return {'status': 'insufficient_memory_after_login', 'nigri_writes': False}
                 # Only one approved empty form GET. No navigation POST permitted.
                 context.unroute('**/*', _hybrid_login_router)
-                context.route('**/*', _preform_route)
+                preform_stats = {'blocked_scripts': 0, 'blocked_stylesheets': 0}
+                preform_router = lambda route: _preform_route(route, preform_stats)
+                context.route('**/*', preform_router)
+                script_errors = {'count': 0}
+                page.on('pageerror', lambda error: script_errors.__setitem__(
+                    'count', min(100, script_errors['count'] + 1)
+                ))
                 stage = 'blank_form'
                 page.goto(BLANK_FORM_URL, wait_until='domcontentloaded', timeout=15000)
                 grade = page.locator('select[name="testGradeID"]')
@@ -140,7 +188,10 @@ def blocked_topic_refresh_trace():
                 # Wait for initial scripts to settle, then replace routing with
                 # unconditional abort before a class-change event can execute.
                 page.wait_for_timeout(250)
-                context.unroute('**/*', _preform_route)
+                initial = _form_snapshot(page, instrument=True)
+                if initial is None:
+                    return {'status': 'form_snapshot_unavailable', 'nigri_writes': False}
+                context.unroute('**/*', preform_router)
                 events = []
                 context.route('**/*', lambda route: _capture_and_abort(route, events))
                 page.on('dialog', lambda dialog: dialog.dismiss())
@@ -154,11 +205,25 @@ def blocked_topic_refresh_trace():
                     # Still return only captured request metadata.
                     pass
                 page.wait_for_timeout(700)
+                after = _form_snapshot(page) or {}
                 kinds = sorted({x['kind'] for x in events})
                 methods = sorted({x['method'] for x in events})
                 return {
-                    'status': 'requests_blocked_and_class_change_inspected',
+                    'status': ('requests_blocked_and_class_change_inspected'
+                               if events else 'no_class_change_requests_observed'),
                     'class_selection_event_completed': selection_executed,
+                    'change_event_observed': after.get('change_event_seen', False),
+                    'b3_et_preselected': initial.get('selected_b3_et', False),
+                    'b3_et_selected_after': after.get('selected_b3_et', False),
+                    'shoroshim_present_initially': initial.get('shoroshim_option_present', False),
+                    'shoroshim_present_after_blocked_change': after.get('shoroshim_option_present', False),
+                    'topic_options_initial_count': initial.get('topic_option_count_capped', 0),
+                    'topic_options_after_count': after.get('topic_option_count_capped', 0),
+                    'topic_dom_replaced': after.get('topic_element_replaced', False),
+                    'inline_grade_handler_present': initial.get('onchange_attribute_present', False),
+                    'blocked_scripts_before_change': preform_stats['blocked_scripts'],
+                    'blocked_stylesheets_before_change': preform_stats['blocked_stylesheets'],
+                    'script_errors_seen_capped': script_errors['count'],
                     'attempted_request_count_capped': len(events),
                     'attempted_methods': methods,
                     'attempted_types': kinds,
