@@ -25,6 +25,25 @@ PBKDF2_ROUNDS = 310000
 TIMEOUT = (10, 60)
 
 
+def _log(step, response, cookies=False):
+    """Safe diagnostics only: step name, HTTP status, content type, reply size, and (login steps) the NUMBER of
+    Set-Cookie headers. Never any body, header value, cookie, token, address, email or password."""
+    try:
+        parts = ['step=' + step, 'status=' + str(response.status_code),
+                 'type=' + str(response.headers.get('content-type', 'none')).split(';')[0][:60],
+                 'bytes=' + str(len(response.content))]
+        if cookies:
+            responses = list(getattr(response, 'history', None) or []) + [response]
+            count = 0
+            for item in responses:
+                raw = getattr(getattr(item, 'raw', None), 'headers', None)
+                if raw is not None and hasattr(raw, 'getlist'): count += len(raw.getlist('Set-Cookie'))
+            parts.append('set_cookie_headers=' + str(count))
+        print('Classtime http: ' + ' '.join(parts), flush=True)
+    except Exception:
+        pass  # Logging must never break a retrieval.
+
+
 # ---- minimal protobuf encoding/decoding (only what these calls need) ----
 
 def _varint(n):
@@ -109,11 +128,12 @@ class ClasstimeHttp:
             'user-agent': 'Mozilla/5.0 (compatible; NigriSync/1.0)',
         })
 
-    def _call(self, name, body, stage):
+    def _call(self, name, body, stage, cookies=False):
         try:
             response = self.http.post(SERVICE + name, data=body, timeout=TIMEOUT)
         except requests.RequestException:
             raise ValueError('Classtime could not be reached at ' + stage + '.') from None
+        _log(stage, response, cookies)
         if response.status_code in (401, 403):
             raise ValueError('Classtime refused the request at ' + stage + ' (status ' + str(response.status_code) + ').')
         if response.status_code != 200:
@@ -121,18 +141,19 @@ class ClasstimeHttp:
         return response.content
 
     def sign_in(self, email, password):
-        state_message = self._call('Account/login', login_request(), 'login step 1')
+        state_message = self._call('Account/login', login_request(), 'login step 1', cookies=True)
         login_state = _read_fields(state_message).get(2)
         if not login_state:
             raise ValueError('Classtime login step 1 gave an unexpected reply.')
-        reply = self._call('Account/authorize', authorize_request(email, password_hash(email, password), login_state), 'login step 2')
+        reply = self._call('Account/authorize', authorize_request(email, password_hash(email, password), login_state), 'login step 2', cookies=True)
         redirect = _read_fields(reply).get(1, b'').decode('utf-8', 'replace')
         host = urlparse(redirect).hostname or ''
         if not (host == 'classtime.com' or host.endswith('.classtime.com')) or urlparse(redirect).scheme != 'https':
             raise ValueError('Classtime login step 2 gave an unexpected reply.')
         try:
             # The page visits this address next; that is where the browser's session is completed.
-            self.http.get(redirect, timeout=TIMEOUT, headers={'accept': 'text/html,*/*'})
+            visit = self.http.get(redirect, timeout=TIMEOUT, headers={'accept': 'text/html,*/*'})
+            _log('login step 3 (visit)', visit, cookies=True)
         except requests.RequestException:
             raise ValueError('Classtime could not be reached after login.') from None
 

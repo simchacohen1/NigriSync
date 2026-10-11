@@ -7,7 +7,7 @@ import classtime_http as ch
 
 
 class FakeResponse:
-    def __init__(self, content=b'', status=200): self.content, self.status_code = content, status
+    def __init__(self, content=b'', status=200): self.content, self.status_code, self.headers = content, status, {'content-type': 'application/protobuf'}
 
 
 class FakeHttp:
@@ -48,6 +48,15 @@ class HttpTests(unittest.TestCase):
         client = ch.ClasstimeHttp(FakeHttp(authorize_status=401))
         with self.assertRaises(ValueError) as caught: client.sign_in('t@x.com', 'secret-pass')
         self.assertNotIn('secret-pass', str(caught.exception)); self.assertNotIn('t@x.com', str(caught.exception))
+    def test_logs_contain_only_safe_facts(self):
+        import contextlib, io
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            client = ch.ClasstimeHttp(FakeHttp()); client.sign_in('teacher@x.com', 'secret-pass'); client.export_zip_url('TIKEV7')
+        log = out.getvalue()
+        self.assertIn('step=login step 1', log); self.assertIn('step=export', log); self.assertIn('status=200', log); self.assertIn('bytes=', log)
+        for secret in ('teacher@x.com', 'secret-pass', 'export.classtime.com', 'questions', 'STATE', 'TIKEV7'):
+            self.assertNotIn(secret, log)
     def test_missing_credentials(self):
         with patch.dict('os.environ', {}, clear=True):
             with self.assertRaises(ValueError): ch.fetch_report_zip('TIKEV7')
