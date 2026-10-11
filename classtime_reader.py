@@ -154,6 +154,11 @@ def _test_session(session_code, inspect_exports=False, review_section=None):
 
 
 def load_review(session_code, class_section):
+    if os.environ.get('CLASSTIME_USE_BROWSER') != '1':
+        # Default: plain web requests, no browser. Set CLASSTIME_USE_BROWSER=1 in Render to go back to the browser version.
+        from classtime_zip import load_review_http
+        from browser_runtime import run_browser
+        return run_browser(load_review_http, session_code, class_section)
     result = test_session(session_code, review_section=class_section)
     if not isinstance(result, tuple):
         raise ValueError('Classtime access failed at ' + str(result.get('stage', result.get('status', 'login'))) + '. No bypass attempted.')
