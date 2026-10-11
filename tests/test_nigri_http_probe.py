@@ -23,7 +23,7 @@ class FakeSession:
             '<form method="post" action="/main/default_os_prog.asp?section=teachers">'
             '<input type="hidden" name="csrf" value="DO_NOT_DISCLOSE">'
             '<input name="login"><input name="password">'
-            '<input type="submit" name="submit" value="Login"></form>'
+            '<input type="image" name="submit" src="login-Button.gif"></form>'
         )
         self.marks_page = marks_page or (
             '<p>Welcome</p><a href="/main/default_os_prog.asp?section=teachers&amp;spec=tests&amp;action=create_test">'
@@ -59,6 +59,9 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual([x[0] for x in session.calls], ['GET', 'POST', 'GET'])
         self.assertTrue(session.calls[1][1].startswith(probe.BASE))
         self.assertEqual(session.calls[1][2]['csrf'], 'DO_NOT_DISCLOSE')
+        self.assertEqual(session.calls[1][2]['submit.x'], '15')
+        self.assertEqual(session.calls[1][2]['submit.y'], '15')
+        self.assertNotIn('submit', session.calls[1][2])
         self.assertEqual(result['create_link_query_keys'], ['action', 'section', 'spec'])
         self.assertNotIn('FAKE_PASSWORD', str(result))
         self.assertNotIn('DO_NOT_DISCLOSE', str(result))
@@ -93,8 +96,24 @@ class ProbeTests(unittest.TestCase):
         s = FakeSession(marks_page='<form><input name="login"><input name="password"></form>')
         result = self.execute(s)
         self.assertEqual(result['status'], 'login_not_accepted')
+        self.assertFalse(result['login_form_returned_after_post'])
+        self.assertTrue(result['image_button_submitted'])
         self.assertFalse(result['nigri_writes'])
         self.assertNotIn('create_link_query_keys', result)
+
+    def test_login_page_after_post_is_reported_without_sensitive_values(self):
+        s = FakeSession(marks_page='<form><input name="login"><input name="password"></form>')
+        original = s.request
+        def login_rejected(method, url, **kwargs):
+            if method == 'POST':
+                s.calls.append((method, url, kwargs.get('data')))
+                return FakeResponse('<form><input name="login"><input name="password"></form>')
+            return original(method, url, **kwargs)
+        s.request = login_rejected
+        result = self.execute(s)
+        self.assertTrue(result['login_form_returned_after_post'])
+        self.assertNotIn('FAKE_PASSWORD', str(result))
+        self.assertEqual([x[0] for x in s.calls], ['GET', 'POST', 'GET'])
 
     def test_page_is_not_assumed_usable_without_evidence(self):
         s = FakeSession(marks_page='<p>Blank page</p>')
