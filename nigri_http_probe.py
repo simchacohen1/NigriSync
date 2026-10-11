@@ -34,15 +34,29 @@ class _Page(HTMLParser):
         self._form = None
         self._a = None
         self.has_create_text = False
+        self._select = None
 
     def handle_starttag(self, tag, attrs):
         a = dict(attrs)
         if tag == 'form':
             self._form = {'action': a.get('action', ''), 'method': (a.get('method') or 'get').lower(), 'inputs': []}
+            self._select = None
             self.forms.append(self._form)
         elif tag == 'input' and self._form is not None:
-            self._form['inputs'].append({'name': a.get('name', ''), 'type': (a.get('type') or 'text').lower(), 'value': a.get('value', '')})
-        elif tag in ('select', 'textarea') and self._form is not None:
+            self._form['inputs'].append({
+                'name': a.get('name', ''), 'id': a.get('id', ''),
+                'type': (a.get('type') or 'text').lower(), 'value': a.get('value', ''),
+            })
+        elif tag == 'select' and self._form is not None:
+            field = {'name': a.get('name', ''), 'type': tag, 'value': '', 'options': []}
+            self._form['inputs'].append(field)
+            # Never collect option values for other selects (which might
+            # contain names/student records); only these public mark selectors.
+            self._select = field if field['name'] in ('testGradeID', 'testTopicID') else None
+        elif tag == 'option' and self._select is not None:
+            # Ignore option labels; never return raw option values.
+            self._select['options'].append(a.get('value', ''))
+        elif tag == 'textarea' and self._form is not None:
             self._form['inputs'].append({'name': a.get('name', ''), 'type': tag, 'value': ''})
         elif tag == 'button' and self._form is not None and a.get('name'):
             self._form['inputs'].append({'name': a['name'], 'type': a.get('type', 'submit').lower(), 'value': a.get('value', '')})
@@ -59,6 +73,9 @@ class _Page(HTMLParser):
     def handle_endtag(self, tag):
         if tag == 'form':
             self._form = None
+            self._select = None
+        if tag == 'select':
+            self._select = None
         if tag == 'a':
             self._a = None
 
@@ -451,6 +468,67 @@ def _header_form_structure(page, fetched_url):
     }
 
 
+def _readonly_mark_form_dependencies(page):
+    """Read the *already fetched* blank form: no further Nigri requests.
+
+    Return only known grade/topic availability and aggregate hidden-field
+    categories. No hidden names/values, unknown option values or page HTML.
+    Class choice may cause AJAX; this DOES NOT infer successful topic refresh.
+    """
+    candidates = [
+        form for form in page.forms
+        if {'testGradeID', 'testName'}.issubset(
+            {i.get('name') for i in form['inputs']}
+        )
+    ]
+    if len(candidates) != 1:
+        return {
+            'status': 'form_ambiguous',
+            'read_only': True,
+            'no_grade_selected': True,
+            'no_ajax_called': True,
+        }
+    inputs = candidates[0]['inputs']
+    grade = [i for i in inputs if i.get('name') == 'testGradeID'
+             and i.get('type') == 'select']
+    topic = [i for i in inputs if i.get('name') == 'testTopicID'
+             and i.get('type') == 'select']
+    hidden = [i for i in inputs if i.get('type') == 'hidden']
+    # Use the IDs already confirmed by the existing browser-based Nigri
+    # integration; do not surface any other IDs or labels from this page.
+    grade_values = set(grade[0].get('options', [])) if len(grade) == 1 else set()
+    topic_values = set(topic[0].get('options', [])) if len(topic) == 1 else set()
+    blank_hidden_count = sum((h.get('value') or '') == '' for h in hidden)
+    zero_hidden_count = sum(h.get('value') == '0' for h in hidden)
+    # Anything else is classified only as "nonblank redacted" for privacy.
+    return {
+        'status': 'form_controls_observed',
+        'b3_et_option_present': '22590' in grade_values,
+        'b3_wt_option_present': '22453' in grade_values,
+        'shoroshim_topic_option_initially_present': '142' in topic_values,
+        'initial_grade_option_count': min(len(grade_values), 100),
+        'initial_topic_option_count': min(len(topic_values), 100),
+        'quiz_type_radio_present': any(
+            x.get('type') == 'radio'
+            and (x.get('value') == 'quiz' or x.get('id') == 'testType_quiz')
+            and (x.get('name') == 'testType' or x.get('name') == 'testType_quiz')
+            for x in inputs
+        ),
+        'hidden_input_count': min(len(hidden), 100),
+        'hidden_blank_count': min(blank_hidden_count, 100),
+        'hidden_zero_count': min(zero_hidden_count, 100),
+        'hidden_nonblank_redacted_count': min(
+            len(hidden) - blank_hidden_count - zero_hidden_count, 100
+        ),
+        'topic_after_grade_selection_verified': False,
+        'hidden_field_required_for_post_verified': False,
+        'no_grade_selected': True,
+        'no_ajax_called': True,
+        'no_submit_performed': True,
+        'read_only': True,
+    }
+
+
 def _offline_header_packet_check(structure):
     """Prepare a dummy header POST *in memory* using approved names only.
 
@@ -538,6 +616,7 @@ def _probe_blank_mark_form(session, marks):
         'create_button_present': create_button,
         'header_form_structure': form_structure,
         'offline_header_rehearsal': header_rehearsal,
+        'readonly_form_dependencies': _readonly_mark_form_dependencies(page),
         'only_one_extra_get': True,
         'no_submit_performed': True,
         'nigri_writes': False,
