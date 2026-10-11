@@ -92,6 +92,9 @@ class SaveTests(unittest.TestCase):
         cr.JOBS.clear(); save.LEDGER.clear()
         STATE.update(saves=[], titles={'titles': ['Some Other Quiz'], 'discovered_ids': 1}, save_behavior=None, limits=[], browser_error=None)
         self.add_review('rev1')
+        previous_pause = server.CLASSTIME_SAVES_PAUSED
+        server.CLASSTIME_SAVES_PAUSED = False  # Mock-only; no real Nigri writes.
+        self.addCleanup(setattr, server, 'CLASSTIME_SAVES_PAUSED', previous_pause)
         self.client = server.app.test_client()
         patcher = patch('google.oauth2.id_token.verify_firebase_token', return_value=claims()); patcher.start(); self.addCleanup(patcher.stop)
         self.addCleanup(cr.JOBS.clear)
@@ -103,6 +106,14 @@ class SaveTests(unittest.TestCase):
         base = {'topic': 'Shoroshim', 'date': '2026-10-09'}
         return self.client.post('/classtime/reviews/' + rid + '/sync-save', json=base if body is None else {**base, **body}, headers=headers)
     def state(self, rid='rev1'): return (cr.JOBS[rid].get('save') or {}).get('state')
+
+    def test_new_production_pause_blocks_all_classtime_writes(self):
+        server.CLASSTIME_SAVES_PAUSED = True
+        response = self.post()
+        self.assertEqual(response.status_code, 423)
+        self.assertFalse(response.get_json()['saved'])
+        self.assertEqual(STATE['saves'], [])
+        self.assertIsNone(self.state())
 
     # ---- who may call it ----
     def test_only_the_owner_google_sign_in_works(self):
