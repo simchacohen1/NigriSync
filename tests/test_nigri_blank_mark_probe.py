@@ -147,6 +147,62 @@ class BlankMarkProbeTests(unittest.TestCase):
                        'PRIVATE_PERSON', 'loginEmail'):
             self.assertNotIn(secret, str(result))
 
+    def test_selection_parameter_types_no_values(self):
+        link = ('/main/default_os_prog.asp?section=teachers&spec=tests'
+                '&testCoursTypeSelect=0&testGradeSelect=12'
+                '&testID=0&testTopicSelect=')
+        html = '<a href="' + link.replace('&', '&amp;') + '">Create New Mark</a>'
+        result, session = self.run_probe(html)
+        self.assertEqual(session.calls, [])
+        diag = result['link_diagnostics']
+        self.assertEqual(diag['selection_parameter_kinds'], {
+            'testCoursTypeSelect': 'zero',
+            'testGradeSelect': 'nonzero_number',
+            'testID': 'zero',
+            'testTopicSelect': 'blank',
+        })
+        self.assertFalse(diag['test_id_may_reference_existing_mark'])
+        self.assertFalse(result['nigri_writes'])
+        self.assertNotIn('12', str(diag))
+
+    def test_nonzero_test_id_may_reference_existing_mark(self):
+        link = ('/main/default_os_prog.asp?section=teachers&spec=tests'
+                '&testCoursTypeSelect=0&testGradeSelect=&testID=98765432&testTopicSelect=1')
+        result, session = self.run_probe(
+            '<a href="' + link.replace('&', '&amp;') + '">Create New Mark</a>')
+        self.assertEqual(session.calls, [])
+        diag = result['link_diagnostics']
+        self.assertEqual(diag['selection_parameter_kinds']['testID'], 'nonzero_number')
+        self.assertTrue(diag['test_id_may_reference_existing_mark'])
+        self.assertNotIn('98765432', str(diag))
+        self.assertFalse(result['nigri_writes'])
+
+    def test_sensitive_selector_values_are_redacted(self):
+        link = ('/main/default_os_prog.asp?section=teachers&spec=tests'
+                '&testCoursTypeSelect=SENSITIVE_DATA&testID=PRIVATE_ID'
+                '&testGradeSelect=unknown&testTopicSelect=-9')
+        result, session = self.run_probe(
+            '<a href="' + link.replace('&', '&amp;') + '">Create New Mark</a>')
+        self.assertEqual(session.calls, [])
+        diag = result['link_diagnostics']
+        self.assertEqual(set(diag['selection_parameter_kinds'].values()),
+                         {'other_redacted'})
+        self.assertTrue(diag['test_id_may_reference_existing_mark'])
+        for value in ('SENSITIVE_DATA', 'PRIVATE_ID', 'unknown', '-9'):
+            self.assertNotIn(value, str(result))
+
+    def test_duplicate_test_id_is_not_considered_blank(self):
+        link = ('/main/default_os_prog.asp?section=teachers&spec=tests'
+                '&testID=0&testID=999')
+        result, session = self.run_probe(
+            '<a href="' + link.replace('&', '&amp;') + '">Create New Mark</a>')
+        self.assertEqual(session.calls, [])
+        diag = result['link_diagnostics']
+        self.assertEqual(diag['selection_parameter_kinds']['testID'],
+                         'repeated_or_missing')
+        self.assertTrue(diag['test_id_may_reference_existing_mark'])
+        self.assertTrue(diag['has_duplicate_keys'])
+
     def test_multiple_create_links_are_rejected(self):
         result, session = self.run_probe(LISTING + LISTING)
         self.assertEqual(result['status'], 'blank_form_link_link_missing_or_ambiguous')
