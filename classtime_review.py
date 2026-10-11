@@ -119,10 +119,24 @@ def verify_pdf(data, students, session_code=None, class_section=None):
     if class_section and not pdf_class_ok(text, class_section):
         raise ValueError('PDF identifies a different class')
     if session_code:
-        score = re.search(r'(\d+(?:\.\d+)?)\s*/\s*(\d+(?:\.\d+)?)\s*points\b', text)
-        if not score or student['points'] is None or float(score.group(1)) != student['points'] or float(score.group(2)) != student['maximum_points']:
+        # A dash means "no result" (the student did not take it). It matches a review that also holds no result.
+        score = re.search(r'(\d+(?:\.\d+)?|-|–|—)[ \t]*/[ \t]*(\d+(?:\.\d+)?)[ \t]*points\b', text)
+        problem = score_mismatch(score, student)
+        if problem:
+            print('Classtime score check: FAILED reason=' + problem + ' pdf_pattern=' + (re.sub(r'\d', '#', score.group(0)) if score else 'none found')
+                  + ' review_pattern=' + ('-/#' if student['points'] is None else '#/#') + ' percent_sign_in_pdf=' + str('%' in text), flush=True)
             raise ValueError('PDF score does not match the reviewed grade')
     return student, text
+
+def score_mismatch(score, student):
+    """None when the PDF score matches the review; otherwise a short reason that contains no real numbers."""
+    if not score: return 'no "x / y points" text found in the PDF'
+    pdf_dash = not score.group(1)[0].isdigit()
+    if pdf_dash != (student['points'] is None): return 'dash vs number'
+    if float(score.group(2)) != student['maximum_points']: return 'maximum points differ'
+    if not pdf_dash and float(score.group(1)) != student['points']:
+        return 'points differ (' + ('within 1 point, rounding-sized' if abs(float(score.group(1)) - student['points']) < 1 else 'more than 1 point apart') + ')'
+    return None
 
 JOBS = {}
 LOCK = threading.Lock()
@@ -239,6 +253,7 @@ def attach_archive_reports(review, archive_path):
     folder = Path(tempfile.mkdtemp(prefix='classtime-reports-'))
     folder.chmod(0o700)
     pdfs = {}
+    failures = []
     try:
         with zipfile.ZipFile(archive_path if isinstance(archive_path, Path) else io.BytesIO(archive_path)) as archive:
             entries = [e for e in archive.infolist() if not e.is_dir() and e.filename.lower().endswith('.pdf')]
@@ -252,9 +267,13 @@ def attach_archive_reports(review, archive_path):
                 with archive.open(entry) as source, path.open('wb') as output:
                     shutil.copyfileobj(source, output, length=65536)
                 path.chmod(0o600)
-                student, _ = verify_pdf(path, review['students'])
-                origin = student.get('source_session', review['session_code'])
-                verify_pdf(path, [student], origin, review['class_section'])
+                try:
+                    student, _ = verify_pdf(path, review['students'])
+                    origin = student.get('source_session', review['session_code'])
+                    verify_pdf(path, [student], origin, review['class_section'])
+                except ValueError as problem:
+                    # Check every report so the log can say how many failed, then refuse the whole review below.
+                    failures.append(str(problem)); path.unlink(missing_ok=True); continue
                 if student['pdf_status'] == 'verified': raise ValueError('Duplicate student report')
                 digest = hashlib.sha256()
                 with path.open('rb') as source:
@@ -264,6 +283,9 @@ def attach_archive_reports(review, archive_path):
                 pdfs[key] = str(path)
                 gc.collect()  # release this PDF's parsed pages before reading the next one
                 log_memory('PDF ' + str(len(pdfs)) + '/' + str(len(entries)) + ' verified')
+        if failures:
+            print('Classtime verification: ' + str(len(failures)) + ' of ' + str(len(entries)) + ' PDFs failed. Reasons: ' + '; '.join(sorted(set(failures))), flush=True)
+            raise ValueError(failures[0])
         for student in review['students']:
             if student['pdf_status'] != 'verified': student.update(pdf_status='missing', pdf_detail='No verified report in this archive')
         review['archive_report_count'] = len(pdfs)

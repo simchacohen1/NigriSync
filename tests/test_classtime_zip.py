@@ -99,5 +99,34 @@ class ClassCheckTests(unittest.TestCase):
         self.assertIn('picked=B3 ET', log); self.assertIn('pdf_class_field=B3 WT', log)
         for secret in ('Sample Alpha', 'ABC123', '9 / 12'): self.assertNotIn(secret, log)
 
+class ScoreCheckTests(ClassCheckTests):
+    def test_student_who_did_not_take_quiz_is_accepted(self):
+        result = self.full([report('Sample Alpha', '9'), report('Sample Beta', '-')])
+        self.assertTrue(all(s['pdf_status'] == 'verified' for s in result['students']))
+        self.assertIsNone(result['students'][1]['points'])
+    def test_decimal_score_is_accepted(self):
+        result = self.full([report('Sample Alpha', '8.5')])
+        self.assertEqual(result['students'][0]['points'], 8.5)
+    def test_real_mismatch_is_still_refused_and_log_is_number_free(self):
+        import contextlib, tempfile
+        from classtime_review import attach_archive_reports
+        with tempfile.TemporaryDirectory() as d:
+            path = make_zip(d, [report('Sample Alpha', '9'), report('Sample Beta', '7')])
+            review = cz.review_from_zip(path, 'ABC123', 'B3 ET')
+            review['students'][1]['points'] = 6.5   # review disagrees with the PDF
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                with self.assertRaises(ValueError): attach_archive_reports(review, path)
+        log = out.getvalue()
+        self.assertIn('1 of 2 PDFs failed', log); self.assertIn('points differ (within 1 point', log); self.assertIn('pdf_pattern=# / # points', log)
+        for secret in ('Sample', '7 / 12', '6.5', '9 / 12'): self.assertNotIn(secret, log)
+    def test_dash_against_a_number_is_refused(self):
+        import tempfile
+        from classtime_review import attach_archive_reports
+        with tempfile.TemporaryDirectory() as d:
+            path = make_zip(d, [report('Sample Alpha', '-')])
+            review = cz.review_from_zip(path, 'ABC123', 'B3 ET'); review['students'][0]['points'] = 5.0
+            with self.assertRaises(ValueError): attach_archive_reports(review, path)
+
 if __name__ == '__main__':
     unittest.main()
