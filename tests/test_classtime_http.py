@@ -57,6 +57,19 @@ class HttpTests(unittest.TestCase):
         self.assertIn('step=login step 1', log); self.assertIn('step=export', log); self.assertIn('status=200', log); self.assertIn('bytes=', log)
         for secret in ('teacher@x.com', 'secret-pass', 'export.classtime.com', 'questions', 'STATE', 'TIKEV7'):
             self.assertNotIn(secret, log)
+    def test_link_is_found_in_any_field_and_export_log_is_safe(self):
+        import contextlib, io
+        class Other(FakeHttp):
+            def post(self, url, data=None, timeout=None):
+                if url.endswith('Session/exportSession'): return FakeResponse(ch._number(1, 1) + ch._raw(7, b'https://export.classtime.com/SECRETID/a.zip'))
+                return super().post(url, data, timeout)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            url = ch.ClasstimeHttp(Other()).export_zip_url('TIKEV7')
+        self.assertTrue(url.endswith('.zip')); log = out.getvalue()
+        self.assertIn('f7:text(len=', log); self.assertIn('export_prefix=True', log); self.assertIn('last4=.zip', log)
+        for secret in ('SECRETID', 'TIKEV7', 'https://export'):
+            self.assertNotIn(secret, log)
     def test_missing_credentials(self):
         with patch.dict('os.environ', {}, clear=True):
             with self.assertRaises(ValueError): ch.fetch_report_zip('TIKEV7')

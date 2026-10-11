@@ -44,6 +44,45 @@ def _log(step, response, cookies=False):
         pass  # Logging must never break a retrieval.
 
 
+def _describe_reply(content, sent_cookie_header=''):
+    """Safe structure summary of an export reply: field numbers, wire types, lengths; for text fields only whether it
+    starts with the export address, its last 4 characters, and whether it mentions error/denied/unauthorized.
+    Plus cookie NAMES sent with the request. Never the text itself, cookie values, emails, passwords or codes."""
+    try:
+        items, i = [], 0
+        def varint():
+            nonlocal i
+            result = shift = 0
+            while i < len(content):
+                byte = content[i]; i += 1
+                result |= (byte & 0x7F) << shift
+                if not byte & 0x80: return result
+                shift += 7
+            raise ValueError('cut')
+        while i < len(content) and len(items) < 20:
+            tag = varint(); number, wire = tag >> 3, tag & 7
+            if wire == 0:
+                varint(); items.append('f%d:varint' % number)
+            elif wire == 2:
+                length = varint(); data = content[i:i + length]; i += length
+                text = None
+                try: text = data.decode('utf-8') if data and all(c >= 32 or c in (9, 10, 13) for c in data) else None
+                except UnicodeDecodeError: pass
+                if text is None: items.append('f%d:bytes(len=%d)' % (number, length))
+                else:
+                    low = text.lower()
+                    items.append('f%d:text(len=%d,export_prefix=%s,last4=%s,error=%s,denied=%s,unauthorized=%s)' % (
+                        number, length, text.startswith('https://export.classtime.com/'), text[-4:],
+                        'error' in low, 'denied' in low, 'unauthorized' in low))
+            elif wire == 1: i += 8; items.append('f%d:64bit' % number)
+            elif wire == 5: i += 4; items.append('f%d:32bit' % number)
+            else: items.append('f%d:wire%d' % (number, wire)); break
+        names = sorted({part.split('=', 1)[0].strip() for part in (sent_cookie_header or '').split(';') if '=' in part})
+        print('Classtime http: export reply fields=[' + ' '.join(items) + '] cookie_names_sent=[' + ','.join(names) + ']', flush=True)
+    except Exception:
+        print('Classtime http: export reply could not be described', flush=True)
+
+
 # ---- minimal protobuf encoding/decoding (only what these calls need) ----
 
 def _varint(n):
@@ -97,6 +136,38 @@ def _read_fields(buf):
     return fields
 
 
+def _read_all_text(buf):
+    """Every top-level length-delimited field that decodes as text, in order."""
+    out = []
+    i = 0
+    try:
+        while i < len(buf):
+            tag = shift = 0
+            while True:
+                byte = buf[i]; i += 1
+                tag |= (byte & 0x7F) << shift; shift += 7
+                if not byte & 0x80: break
+            wire = tag & 7
+            if wire == 2:
+                length = shift = 0
+                while True:
+                    byte = buf[i]; i += 1
+                    length |= (byte & 0x7F) << shift; shift += 7
+                    if not byte & 0x80: break
+                try: out.append(bytes(buf[i:i + length]).decode('utf-8'))
+                except UnicodeDecodeError: pass
+                i += length
+            elif wire == 0:
+                while buf[i] & 0x80: i += 1
+                i += 1
+            elif wire == 1: i += 8
+            elif wire == 5: i += 4
+            else: break
+    except IndexError:
+        pass
+    return out
+
+
 def password_hash(email, password):
     """Same scramble as Classtime's page: PBKDF2-SHA256, 310000 rounds, salt 'classtime' + lowercase email."""
     return hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), ('classtime' + email.lower()).encode('utf-8'), PBKDF2_ROUNDS, 32)
@@ -134,6 +205,8 @@ class ClasstimeHttp:
         except requests.RequestException:
             raise ValueError('Classtime could not be reached at ' + stage + '.') from None
         _log(stage, response, cookies)
+        if stage == 'export':
+            _describe_reply(response.content, getattr(getattr(response, 'request', None), 'headers', {}).get('Cookie', ''))
         if response.status_code in (401, 403):
             raise ValueError('Classtime refused the request at ' + stage + ' (status ' + str(response.status_code) + ').')
         if response.status_code != 200:
@@ -161,7 +234,7 @@ class ClasstimeHttp:
         if not re.fullmatch(r'[A-Z0-9]{6}', session_code):
             raise ValueError('A six-character session code is required')
         reply = self._call('Session/exportSession', export_request(session_code, time_zone), 'export')
-        url = _read_fields(reply).get(1, b'').decode('utf-8', 'replace')
+        url = next((v for v in _read_all_text(reply) if v.startswith('https://export.classtime.com/')), '')
         parsed = urlparse(url)
         if parsed.scheme != 'https' or parsed.hostname != EXPORT_HOST:
             raise ValueError('Classtime export gave an unexpected reply.')
