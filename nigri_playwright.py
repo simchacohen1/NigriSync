@@ -950,6 +950,8 @@ def run_marks_sync(
     test_date=None,
     description=None,
     mark_all_done=True,
+    *,
+    classtime_memory_saver=False,
 ):
     """
     The real, production version of the School Marks push -- the quiz
@@ -973,6 +975,8 @@ def run_marks_sync(
       "absent" | "review", "comment": (optional)}, ...] -- "name" must
       be a key in REWARDS_CHILD_IDS.
     mark_type: one of "homework", "test", "quiz", "classwork".
+    classtime_memory_saver: use the Classtime-only, lower-memory Chromium flags;
+      the existing Attendance and Weekly Quiz callers are unaffected.
     """
     if class_section not in MARKS_GRADE_IDS:
         raise ValueError(f"Unknown class_section: {class_section}")
@@ -982,7 +986,13 @@ def run_marks_sync(
     results = []
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        # Classtime-only low-RAM browser; all other Nigri callers retain
+        # their original Chromium launch settings.
+        if classtime_memory_saver:
+            from classtime_reader import _chromium_args
+            browser = p.chromium.launch(headless=True, args=_chromium_args())
+        else:
+            browser = p.chromium.launch(headless=True)
         page = browser.new_page()
 
         login(page)
