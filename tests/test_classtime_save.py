@@ -125,6 +125,7 @@ class SaveTests(unittest.TestCase):
         self.assertEqual(len(STATE['saves']), 1); call = STATE['saves'][0]
         self.assertEqual((call['class_section'], call['topic'], call['mark_type'], call['test_date']), ('B3 ET', 'Shoroshim', 'quiz', '2026-10-09'))
         self.assertEqual(call['test_name'], 'Made Up Quiz (ABC123)'); self.assertTrue(call['mark_all_done'])
+        self.assertTrue(call['classtime_memory_saver'])  # Only Classtime saves use lighter Chromium
         rows = {s['name']: s for s in call['students']}
         self.assertEqual(set(rows), {'Ann Nigri', 'Ben Nigri', 'Dee Nigri'})            # unmatched boy never sent; browser rows ignored
         self.assertEqual((rows['Ann Nigri']['mark'], rows['Dee Nigri']['mark']), (75, 100))
