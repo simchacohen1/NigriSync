@@ -113,3 +113,16 @@ Tests use made-up names and mock storage only: `python -m unittest tests.test_ni
 (plus the last 4 letters of the username), saves/replaces it, or removes it. Answers 404 unless `NIGRI_LOGIN_ENABLED=1`.
 `FIREBASE_PROJECT_ID` (default `b3-games`) says which Firebase project's sign-ins and teacher list to trust, so a
 staging copy uses `fun-torah-tools-staging`. It never contacts Nigri and the old shared key does not open it.
+
+### Grade + course matching (issue 550, step 3)
+`nigri_courses.py` and `GET /nigri-courses?class=<id>`: a teacher's class belongs to a Nigri grade (`B3 ET` / `B3 WT`;
+ET and WT default, other classes need `classes/<id>/nigriGrade` set by the owner). Inside the grade the sync picks a
+course ID (Davening, Morning 1-3, Friday 1-3; WT has no Friday). Match is by ID only, shared rooms can never be targets,
+and a course is on only if the teacher's own Nigri login can see it. The read-only Nigri course reader is NOT built:
+until it is, every course reports "not connected yet" and stays off. `resolve_course` is what the sync (step 4) will call.
+
+### Read-only course reader (issue 550, step 3b)
+`nigri_course_reader.py`: signs in once with a teacher's OWN Nigri login and reads only the class picker (course IDs and
+names). Only the sign-in POST (exact sign-in address) is allowed; every other write is aborted in the browser. It never
+opens attendance, marks or student lists. To SEE what it finds, run `python read_courses_cli.py` yourself (the password
+is typed hidden, never saved). On the server it is off unless `NIGRI_COURSE_READER=1`.
