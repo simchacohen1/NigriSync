@@ -44,6 +44,15 @@ def not_connected_lister(_credentials):
     raise CoursesUnavailable('Reading your Nigri classes is not connected yet')
 
 
+def default_lister():
+    """Off by default. NIGRI_COURSE_READER=1 turns on the read-only reader that uses the teacher's own login."""
+    import os
+    if os.environ.get('NIGRI_COURSE_READER') == '1':
+        from nigri_course_reader import server_lister
+        return server_lister
+    return not_connected_lister
+
+
 def is_shared_room(name):
     text = str(name or '').lower()
     return any(room in text for room in SHARED_ROOMS)

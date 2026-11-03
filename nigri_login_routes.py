@@ -154,7 +154,7 @@ def course_matches():
             credentials = None
         workspace = os.environ.get('NIGRI_LOGIN_WORKSPACE', 'b3-2026')
         result = N.course_status(_read_path, workspace, uid, request.args.get('class', ''), credentials,
-                                 _lister or N.not_connected_lister)
+                                 _lister or N.default_lister())
         return _reply(result)
     except N.MatchError as exc:
         return _reply({'error': exc.message, 'code': exc.code}, 403 if exc.code == 'not_your_class' else 400)

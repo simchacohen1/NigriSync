@@ -120,3 +120,9 @@ ET and WT default, other classes need `classes/<id>/nigriGrade` set by the owner
 course ID (Davening, Morning 1-3, Friday 1-3; WT has no Friday). Match is by ID only, shared rooms can never be targets,
 and a course is on only if the teacher's own Nigri login can see it. The read-only Nigri course reader is NOT built:
 until it is, every course reports "not connected yet" and stays off. `resolve_course` is what the sync (step 4) will call.
+
+### Read-only course reader (issue 550, step 3b)
+`nigri_course_reader.py`: signs in once with a teacher's OWN Nigri login and reads only the class picker (course IDs and
+names). Only the sign-in POST (exact sign-in address) is allowed; every other write is aborted in the browser. It never
+opens attendance, marks or student lists. To SEE what it finds, run `python read_courses_cli.py` yourself (the password
+is typed hidden, never saved). On the server it is off unless `NIGRI_COURSE_READER=1`.
