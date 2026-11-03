@@ -42,7 +42,7 @@ def allow_request(method, url, state):
 
 
 def install_read_only_guard(page):
-    state = {'posted': False, 'blocked': []}
+    state = {'posted': False, 'blocked': [], 'blocked_detail': []}
 
     def handler(route):
         req = route.request
@@ -51,9 +51,96 @@ def install_read_only_guard(page):
         if allow_request(req.method, req.url, state):
             return route.continue_()
         state['blocked'].append(req.method)
+        state['blocked_detail'].append(req.method + ' ' + safe_address(req.url))
         return route.abort()
     page.route('**/*', handler)
     return state
+
+
+SAFE_QUERY = {'section', 'subSection', 'side'}   # page-type words only; every other value is hidden
+_SAFE_VALUE = re.compile(r'[A-Za-z]{1,30}|\d{1,2}')
+
+
+def safe_address(url):
+    """Address for the owner to read: host + path, query NAMES only (values shown only for page-type words)."""
+    parts = urlsplit(str(url or ''))
+    shown = []
+    for key, values in parse_qs(parts.query, keep_blank_values=True).items():
+        key = re.sub(r'[^A-Za-z0-9_.-]', '?', key)[:40]
+        value = values[0] if values else ''
+        shown.append('%s=%s' % (key, value if key in SAFE_QUERY and _SAFE_VALUE.fullmatch(value) else '(hidden)'))
+    base = '%s://%s%s' % (parts.scheme or '?', parts.netloc, parts.path) if parts.netloc else (parts.path or '(none)')
+    return base + ('?' + '&'.join(shown) if shown else '')
+
+
+# Reads names and types only. NEVER values, option text, page text, links or table contents (those could hold student data).
+STRUCTURE_JS = r"""() => {
+  const cap = (v, n) => (v == null ? null : String(v).slice(0, n));
+  const every = [...document.querySelectorAll('input,select,textarea,button')];
+  const picked = every.filter(e => e.tagName === 'SELECT').slice(0, 40).concat(every.filter(e => e.tagName !== 'SELECT').slice(0, 400));
+  const fields = picked.map(e => {
+    const tag = e.tagName.toLowerCase();
+    const row = {tag, type: cap(e.type, 20) || null, id: cap(e.id, 60) || null, name: cap(e.name, 60) || null};
+    if (tag === 'select') {
+      const opts = [...e.options];
+      row.optionCount = opts.length;
+      row.optionsMatchingClassNames = opts.filter(o => /B3 (ET|WT)/i.test(o.textContent || '')).length;
+      row.optionsWithNumericValue = opts.filter(o => /^\d+$/.test(o.value)).length;
+    }
+    return row;
+  });
+  const frames = [...document.querySelectorAll('iframe,frame')].slice(0, 20).map(f => ({id: cap(f.id, 60) || null, name: cap(f.name, 60) || null, src: f.getAttribute('src')}));
+  return {title: cap(document.title, 120), hasPasswordField: !!document.querySelector('input[type=password]'), fields, frames};
+}"""
+
+
+def _mask(text):
+    """Long digit runs in ids/names could be student numbers: show them as #."""
+    return re.sub(r'\d{3,}', '#', text) if isinstance(text, str) else text
+
+
+def collapse_fields(fields, limit=60):
+    """Mask ID-like digits, merge repeats (one row per kind of field, with a count), keep dropdowns first."""
+    merged, order = {}, []
+    for f in fields:
+        row = dict(f, id=_mask(f.get('id')), name=_mask(f.get('name')))
+        key = (row['tag'], row.get('type'), row['id'], row['name'], row.get('optionCount'),
+               row.get('optionsMatchingClassNames'), row.get('optionsWithNumericValue'))
+        if key in merged:
+            merged[key]['count'] += 1
+        else:
+            row['count'] = 1
+            merged[key] = row
+            order.append(key)
+    rows = [merged[k] for k in order]
+    return ([r for r in rows if r['tag'] == 'select'] + [r for r in rows if r['tag'] != 'select'])[:limit]
+
+
+def inspect_page(page):
+    """Structure of the page and every frame: title, masked address, field/dropdown names. Read only."""
+    out = []
+    for frame in page.frames:
+        try:
+            info = frame.evaluate(STRUCTURE_JS)
+        except Exception:
+            info = {'title': None, 'hasPasswordField': False, 'fields': [], 'frames': [], 'unreadable': True}
+        info['fields'] = collapse_fields(info.get('fields', []))
+        info['address'] = safe_address(getattr(frame, 'url', ''))
+        for sub in info.get('frames', []):
+            sub['src'] = safe_address(sub.get('src'))
+        out.append(info)
+    return out
+
+
+def sign_in_verdict(posted, blocked_detail, structure):
+    """(verdict, plain sentence). SUCCEEDED only if the sign-in was sent and no password box is left on screen."""
+    if blocked_detail and not posted:
+        return 'NOT SENT', 'The sign-in form tried to send to an address this tool does not allow, so it was stopped before anything was sent: ' + '; '.join(blocked_detail)
+    if any(f.get('hasPasswordField') for f in structure):
+        return 'FAILED', 'The sign-in form is still showing after sending it, so Nigri did not accept the sign-in.'
+    if posted:
+        return 'SUCCEEDED', 'The sign-in was sent and the sign-in form is gone, so Nigri accepted it.'
+    return 'COULD NOT TELL', 'The sign-in button was clicked but no sign-in request was seen.'
 
 
 def read_picker(page):
@@ -96,6 +183,37 @@ def login_and_read(username, password, launch):
         if state['blocked']:
             raise ReaderError('Stopped: a non-read request was blocked (%s).' % ', '.join(sorted(set(state['blocked']))))
         return raw
+    finally:
+        close()
+
+
+def login_and_inspect(username, password, launch):
+    """For the owner's own check: sign in once, then report the verdict and the page structure (names only)."""
+    page, close = launch()
+    try:
+        state = install_read_only_guard(page)
+        page.goto(LOGIN_URL)
+        page.fill('input[name="login"]', username)
+        page.fill('input[name="password"]', password)
+        page.click('input[name="submit"]')
+        page.wait_for_load_state('networkidle')
+        try:
+            page.wait_for_timeout(1500)   # frames can finish loading a moment after the page
+        except Exception:
+            pass
+        structure = inspect_page(page)
+        verdict, sentence = sign_in_verdict(state['posted'], state['blocked_detail'], structure)
+        picker = None
+        for frame in page.frames:
+            try:
+                if frame.query_selector(PICKER):
+                    picker = parse_options(frame.eval_on_selector_all(
+                        PICKER + ' option', 'els => els.map(o => ({value: o.value, name: (o.textContent || "").trim()}))'))
+                    break
+            except Exception:
+                continue
+        return {'signIn': verdict, 'signInDetail': sentence, 'blockedRequests': state['blocked_detail'],
+                'pages': structure, 'classPickerFound': picker is not None, 'courses': picker}
     finally:
         close()
 

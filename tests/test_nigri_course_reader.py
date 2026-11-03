@@ -53,6 +53,7 @@ class FakePage:
     def goto(self, url): self.actions.append(('goto', url))
     def fill(self, sel, value): self.actions.append(('fill', sel))   # value deliberately not recorded
     def wait_for_load_state(self, s): pass
+    def wait_for_timeout(self, ms): pass
 
     def click(self, sel):
         self.actions.append(('click', sel))
@@ -209,8 +210,8 @@ class SourceRulesTests(unittest.TestCase):
         code = ast.unparse(tree)
         for word in ('#attend', 'attend', 'student', 'marks', 'select_option', '.check(', '.type(', 'press('):
             self.assertNotIn(word, code.lower(), word)
-        self.assertEqual(len(re.findall(r'\.click\(', code)), 1)
-        self.assertEqual(len(re.findall(r'\.fill\(', code)), 2)
+        self.assertEqual(len(re.findall(r'\.click\(', code)), 2)   # the sign-in button, once in each of the two flows
+        self.assertEqual(len(re.findall(r'\.fill\(', code)), 4)   # username + password, once in each flow
 
     def test_password_is_never_printed_logged_or_written(self):
         for name in ('nigri_course_reader.py', 'read_courses_cli.py'):
@@ -218,12 +219,119 @@ class SourceRulesTests(unittest.TestCase):
             self.assertNotRegex(code, r'print\([^)]*password|logging|logger|write_text\([^)]*password')
         cli = (self.root / 'read_courses_cli.py').read_text(encoding='utf-8')
         self.assertIn('getpass.getpass', cli)
-        self.assertIn("json.dumps(report", cli)
+        self.assertIn("json.dumps(result", cli)
 
     def test_nothing_else_imports_the_reader(self):
         users = [p.name for p in self.root.glob('*.py') if p.name not in ('nigri_course_reader.py', 'read_courses_cli.py')
                  and 'nigri_course_reader' in p.read_text(encoding='utf-8')]
         self.assertEqual(sorted(users), ['nigri_courses.py'])   # only the off-by-default switch
+
+
+class InspectFrame(Frame):
+    """A frame that can describe itself the way the real page script would (names only)."""
+
+    def __init__(self, url, info, options=None):
+        super().__init__(options)
+        self.url, self.info = url, info
+
+    def evaluate(self, js):
+        assert js == R.STRUCTURE_JS
+        return dict(self.info)
+
+
+class InspectPage(FakePage):
+    def __init__(self, frames, post_goes_to=LOGIN, **kw):
+        super().__init__(RAW, **kw)
+        self._frames, self.post_goes_to = frames, post_goes_to
+
+    def click(self, sel):
+        self.actions.append(('click', sel))
+        r = Route(Req('POST', self.post_goes_to)); self.handler(r); self.results.append(('POST', r.result))
+        self.frames = self._frames
+
+
+HOME = {'title': 'Teacher home', 'hasPasswordField': False, 'frames': [{'id': 'list', 'name': 'list', 'src': '/main/list.asp?classID=28734&x=1'}],
+        'fields': [{'tag': 'select', 'type': 'select-one', 'id': 'selNewCours', 'name': 'sel', 'optionCount': 3,
+                    'optionsMatchingClassNames': 2, 'optionsWithNumericValue': 3}]}
+LOGIN_FORM = {'title': 'Login', 'hasPasswordField': True, 'frames': [], 'fields': [{'tag': 'input', 'type': 'password', 'id': None, 'name': 'password'}]}
+
+
+class InspectTests(unittest.TestCase):
+    def run_inspect(self, frames, **kw):
+        launch, closed = launcher(InspectPage(frames, **kw))
+        return R.login_and_inspect(USER, PW, launch), closed
+
+    def test_succeeded_says_so_and_reports_names_only(self):
+        res, closed = self.run_inspect([InspectFrame(GOOD + '/main/default_os_prog.asp?section=teachers&uid=998877', HOME)])
+        self.assertEqual(res['signIn'], 'SUCCEEDED')
+        self.assertEqual(res['pages'][0]['title'], 'Teacher home')
+        self.assertEqual(res['pages'][0]['address'], GOOD + '/main/default_os_prog.asp?section=teachers&uid=(hidden)')
+        self.assertEqual(res['pages'][0]['frames'][0]['src'], '/main/list.asp?classID=(hidden)&x=(hidden)')
+        self.assertEqual(res['pages'][0]['fields'][0]['id'], 'selNewCours')
+        self.assertEqual(closed, [1])
+        blob = str(res)
+        for secret in (PW, USER, '998877', '28734'):
+            self.assertNotIn(secret, blob)
+
+    def test_failed_when_the_form_is_still_there(self):
+        res, _ = self.run_inspect([InspectFrame(LOGIN, LOGIN_FORM)])
+        self.assertEqual(res['signIn'], 'FAILED')
+        self.assertIn('did not accept', res['signInDetail'])
+        self.assertFalse(res['classPickerFound'])
+
+    def test_not_sent_when_the_form_posts_somewhere_else(self):
+        res, _ = self.run_inspect([InspectFrame(LOGIN, LOGIN_FORM)], post_goes_to=GOOD + '/main/other.asp?token=abc123')
+        self.assertEqual(res['signIn'], 'NOT SENT')
+        self.assertIn('stopped before anything was sent', res['signInDetail'])
+        self.assertIn('POST ' + GOOD + '/main/other.asp?token=(hidden)', res['blockedRequests'])
+        self.assertNotIn('abc123', str(res))
+
+    def test_verdict_rules(self):
+        self.assertEqual(R.sign_in_verdict(True, [], [HOME])[0], 'SUCCEEDED')
+        self.assertEqual(R.sign_in_verdict(False, [], [HOME])[0], 'COULD NOT TELL')
+        self.assertEqual(R.sign_in_verdict(True, [], [HOME, LOGIN_FORM])[0], 'FAILED')
+
+    def test_class_picker_flag_and_courses(self):
+        res, _ = self.run_inspect([InspectFrame(GOOD + '/x', HOME, options=RAW)])
+        self.assertTrue(res['classPickerFound'])
+        self.assertEqual(len(res['courses']), 5)
+
+    def test_unreadable_frame_is_reported_not_fatal(self):
+        class Bad(InspectFrame):
+            def evaluate(self, js): raise RuntimeError('boom ' + PW)
+        res, _ = self.run_inspect([Bad(GOOD + '/x', HOME)])
+        self.assertTrue(res['pages'][0]['unreadable'])
+        self.assertNotIn(PW, str(res))
+
+
+class SafeAddressTests(unittest.TestCase):
+    def test_hides_values_except_page_type_words(self):
+        self.assertEqual(R.safe_address(GOOD + '/m.asp?section=teachers&subSection=tests&side=1&id=77&n=Moshe'),
+                         GOOD + '/m.asp?section=teachers&subSection=tests&side=1&id=(hidden)&n=(hidden)')
+        self.assertEqual(R.safe_address(GOOD + '/m.asp?section=Moshe%20Cohen'), GOOD + '/m.asp?section=Moshe Cohen'.replace('Moshe Cohen', '(hidden)'))
+        self.assertEqual(R.safe_address(None), '(none)')
+        self.assertEqual(R.safe_address('/a/b.asp?z=9'), '/a/b.asp?z=(hidden)')
+        self.assertNotIn('#frag', R.safe_address(GOOD + '/p#frag'))
+
+    def test_collapse_masks_ids_and_merges_repeats(self):
+        rows = [{'tag': 'input', 'type': 'checkbox', 'id': 'present_%d' % n, 'name': 'cb'} for n in (11111, 22222, 33333)]
+        rows.append({'tag': 'select', 'type': 'select-one', 'id': 'x', 'name': 'y', 'optionCount': 1})
+        out = R.collapse_fields(rows)
+        self.assertEqual(out[0]['tag'], 'select')   # dropdowns first
+        self.assertEqual([(r['id'], r['count']) for r in out[1:]], [('present_#', 3)])
+
+    def test_structure_script_reads_names_only(self):
+        js = R.STRUCTURE_JS
+        for banned in ('innerText', 'innerHTML', 'href', 'outerHTML', 'cookie', 'localStorage', 'fetch(', 'click(', 'submit(', '.value =', 'dispatchEvent'):
+            self.assertNotIn(banned, js, banned)
+        self.assertEqual(js.count('.value'), 1)         # only inside the numeric-count filter, never output
+        self.assertEqual(js.count('textContent'), 1)    # only inside the "looks like a class" count, never output
+
+    def test_cli_prints_no_values_and_asks_hidden(self):
+        cli = (Path(R.__file__).parent / 'read_courses_cli.py').read_text(encoding='utf-8')
+        self.assertIn('getpass.getpass', cli)
+        self.assertNotIn("['courses']", cli.split('def main')[1].split('show(result)')[1].replace("result.pop('courses', None)", ''))
+        self.assertIn("result.pop('courses', None)", cli)   # course names are not written to the saved file
 
 
 if __name__ == '__main__':
