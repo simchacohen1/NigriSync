@@ -14,6 +14,7 @@ import nigri_courses as N
 USER, PW = 'fakeowner@example.test', 'Fake-Owner-Pw-9'
 GOOD = 'https://www.nigrijewishonlineschool.com'
 LOGIN = R.LOGIN_URL
+SIGNIN_POST = GOOD + '/main/default_os_prog.asp?section=teachers&subSection=signin&login=made%20up%20name&pagesreturn=home'
 
 
 class Frame:
@@ -57,7 +58,7 @@ class FakePage:
 
     def click(self, sel):
         self.actions.append(('click', sel))
-        for req in [Req('POST', LOGIN)] + self.extra:
+        for req in [Req('POST', SIGNIN_POST)] + self.extra:
             r = Route(req); self.handler(r); self.results.append((req.method, r.result))
         self.frames = [Frame(self.options)] if self.signed_in else [Frame(None)]
 
@@ -80,13 +81,28 @@ class GuardTests(unittest.TestCase):
     def test_only_gets_and_exactly_one_sign_in_post(self):
         s = {}
         self.assertTrue(R.allow_request('GET', GOOD + '/main/anything.asp?x=1', s))
-        self.assertTrue(R.allow_request('POST', LOGIN, s))
-        self.assertFalse(R.allow_request('POST', LOGIN, s))   # a second POST, even to the login page
-        for url in (GOOD + '/main/default_os_prog.asp', GOOD + '/main/default_os_prog.asp?section=teachers&subSection=tests&side=1',
-                    GOOD + '/main/default_os_prog.asp?section=teachers&save=1'):
-            self.assertFalse(R.allow_request('POST', url, {}), url)   # same page address, different query: refused
-        for method in ('POST', 'PUT', 'DELETE', 'PATCH'):
-            self.assertFalse(R.allow_request(method, GOOD + '/main/default_os_prog.asp?subSection=tests&save=1', {}), method)
+        self.assertTrue(R.allow_request('POST', SIGNIN_POST, s))
+        self.assertFalse(R.allow_request('POST', SIGNIN_POST, s))   # a second POST, even an identical one
+        for method in ('PUT', 'DELETE', 'PATCH'):
+            self.assertFalse(R.allow_request(method, SIGNIN_POST, {}), method)
+
+    def test_the_sign_in_post_must_match_exactly(self):
+        base = GOOD + '/main/default_os_prog.asp?'
+        good = 'section=teachers&subSection=signin&login=x&pagesreturn=home'
+        self.assertTrue(R.is_signin_post(base + good))
+        self.assertTrue(R.is_signin_post('https://nigrijewishonlineschool.com/main/default_os_prog.asp?' + good))
+        for url in (base + good + '&save=1',                                        # an extra key
+                    base + 'section=teachers&subSection=signin&login=x',            # a missing key
+                    base + good.replace('section=teachers', 'section=students'),    # other section
+                    base + good + '&section=teachers',                              # repeated key
+                    base + 'section=teachers&subSection=tests&side=1',              # a marks page
+                    GOOD + '/main/other.asp?' + good,                               # other path
+                    GOOD + '/main/default_os_prog.asp',
+                    'http://www.nigrijewishonlineschool.com/main/default_os_prog.asp?' + good,
+                    'https://www.nigrijewishonlineschool.com.evil.test/main/default_os_prog.asp?' + good,
+                    base + good.replace('login=x', 'login=' + 'x' * 300)):
+            self.assertFalse(R.is_signin_post(url), url)
+            self.assertFalse(R.allow_request('POST', url, {}), url)
 
     def test_other_hosts_and_schemes_never_allowed(self):
         for url in ('https://evil.example.test/', 'http://www.nigrijewishonlineschool.com/x', 'https://www.nigrijewishonlineschool.com.evil.test/x',
@@ -97,10 +113,52 @@ class GuardTests(unittest.TestCase):
         page = FakePage(RAW)
         state = R.install_read_only_guard(page)
         for req, want in ((Req('GET', GOOD + '/a.asp'), 'continue'), (Req('GET', GOOD + '/i.png', 'image'), 'abort'),
-                          (Req('POST', GOOD + '/main/save.asp'), 'abort'), (Req('POST', LOGIN), 'continue'), (Req('POST', LOGIN), 'abort')):
+                          (Req('POST', GOOD + '/main/save.asp'), 'abort'), (Req('POST', SIGNIN_POST), 'continue'), (Req('POST', SIGNIN_POST), 'abort')):
             r = Route(req); page.handler(r)
             self.assertEqual(r.result, want, (req.method, req.url))
         self.assertEqual(state['blocked'], ['POST', 'POST'])
+        self.assertEqual(state['tracking_blocked'], 0)
+
+
+class TrackingTests(unittest.TestCase):
+    URLS = ('https://www.googletagmanager.com/gtag/js?id=G-X', 'https://www.clarity.ms/tag/abc', 'https://c.clarity.ms/collect',
+            'https://www.google-analytics.com/g/collect', 'https://stats.g.doubleclick.net/x')
+
+    def test_tracking_hosts_are_recognised_exactly(self):
+        for url in self.URLS:
+            self.assertTrue(R.is_tracking(url), url)
+        for url in (GOOD + '/x', 'https://clarity.ms.evil.test/x', 'https://notclarity.ms/x', 'https://example.test/x', None):
+            self.assertFalse(R.is_tracking(url), url)
+
+    def test_tracking_is_dropped_quietly_and_is_not_a_failure(self):
+        page = FakePage(RAW)
+        state = R.install_read_only_guard(page)
+        for url in self.URLS:
+            r = Route(Req('GET', url, 'script')); page.handler(r)
+            self.assertEqual(r.result, 'abort')
+        self.assertEqual(state['tracking_blocked'], len(self.URLS))
+        self.assertEqual((state['blocked'], state['blocked_detail']), ([], []))
+
+    def test_a_tracking_url_can_never_carry_a_write(self):
+        page = FakePage(RAW)
+        state = R.install_read_only_guard(page)
+        r = Route(Req('POST', 'https://www.clarity.ms/collect')); page.handler(r)
+        self.assertEqual(r.result, 'abort')
+
+    def test_run_with_tracking_and_a_stray_get_still_succeeds(self):
+        page = InspectPage([InspectFrame(GOOD + '/main/home.asp', HOME)], extra_requests=[
+            Req('GET', 'https://www.googletagmanager.com/gtag/js?id=G-X', 'script'), Req('GET', 'https://cdn.example.test/lib.js', 'script')])
+        launch, _ = launcher(page)
+        res = R.login_and_inspect(USER, PW, launch)
+        self.assertEqual(res['signIn'], 'SUCCEEDED')
+        self.assertEqual(res['trackingScriptsDropped'], 1)
+        self.assertEqual(res['blockedRequests'], ['GET https://cdn.example.test/lib.js'])   # shown for information, not a failure
+
+    def test_a_blocked_write_still_stops_the_server_reader(self):
+        page = FakePage(RAW, extra_requests=[Req('POST', GOOD + '/main/default_os_prog.asp?section=teachers&subSection=tests&save=1')])
+        launch, _ = launcher(page)
+        with self.assertRaises(R.ReaderError):
+            R.login_and_read(USER, PW, launch)
 
 
 class ReadTests(unittest.TestCase):
@@ -111,7 +169,7 @@ class ReadTests(unittest.TestCase):
         self.assertEqual(raw, RAW)
         self.assertEqual(closed, [1])
         self.assertEqual([a[0] for a in page.actions], ['goto', 'fill', 'fill', 'click'])
-        self.assertEqual(page.actions[0][1], LOGIN)
+        self.assertEqual(page.actions[0][1], LOGIN)   # the page it opens is the plain sign-in page (a GET)
         self.assertEqual(page.actions[3][1], 'input[name="submit"]')
         self.assertEqual(page.results, [('POST', 'continue')])
 
@@ -240,13 +298,14 @@ class InspectFrame(Frame):
 
 
 class InspectPage(FakePage):
-    def __init__(self, frames, post_goes_to=LOGIN, **kw):
+    def __init__(self, frames, post_goes_to=SIGNIN_POST, **kw):
         super().__init__(RAW, **kw)
         self._frames, self.post_goes_to = frames, post_goes_to
 
     def click(self, sel):
         self.actions.append(('click', sel))
-        r = Route(Req('POST', self.post_goes_to)); self.handler(r); self.results.append(('POST', r.result))
+        for req in [Req('POST', self.post_goes_to)] + self.extra:
+            r = Route(req); self.handler(r); self.results.append((req.method, r.result))
         self.frames = self._frames
 
 

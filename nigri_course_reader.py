@@ -24,29 +24,58 @@ class ReaderError(Exception):
     """Plain-words failure, never contains a password."""
 
 
+NIGRI_HOSTS = ('www.nigrijewishonlineschool.com', 'nigrijewishonlineschool.com')
+# Nigri's real teacher sign-in POST (seen in the owner's first run): same page, with exactly these query parts.
+SIGNIN_POST_KEYS = {'section', 'subSection', 'login', 'pagesreturn'}
+TRACKING_SUFFIXES = ('googletagmanager.com', 'google-analytics.com', 'analytics.google.com', 'doubleclick.net', 'clarity.ms',
+                     'googlesyndication.com', 'googleadservices.com', 'facebook.net', 'connect.facebook.com', 'hotjar.com',
+                     'bat.bing.com', 'c.bing.com')
+
+
+def is_tracking(url):
+    host = (urlsplit(str(url or '')).hostname or '').lower()
+    return any(host == t or host.endswith('.' + t) for t in TRACKING_SUFFIXES)
+
+
+def is_signin_post(url):
+    """The one POST Nigri's sign-in form makes: same host and path as the sign-in page, section=teachers, and exactly the
+    query keys section, subSection, login, pagesreturn (each once, values short). Any other key, or a missing one: no."""
+    parts = urlsplit(url)
+    login = urlsplit(LOGIN_URL)
+    if parts.scheme != 'https' or parts.hostname not in NIGRI_HOSTS or parts.path != login.path:
+        return False
+    query = parse_qs(parts.query, keep_blank_values=True)
+    if set(query) != SIGNIN_POST_KEYS or any(len(v) != 1 for v in query.values()):
+        return False
+    if query['section'] != ['teachers']:
+        return False
+    return all(len(v[0]) <= 200 and v[0].isprintable() for v in query.values())
+
+
 def allow_request(method, url, state):
     """True if this request may go out. `state` is a dict used to allow exactly one sign-in POST."""
     parts = urlsplit(url)
-    if parts.scheme != 'https' or parts.hostname not in ('www.nigrijewishonlineschool.com', 'nigrijewishonlineschool.com'):
+    if parts.scheme != 'https' or parts.hostname not in NIGRI_HOSTS:
         return False
     if method == 'GET':
         return True
-    login = urlsplit(LOGIN_URL)
-    # Nigri uses ONE page address for everything (sign-in, attendance, marks), told apart only by the query. So the
-    # single allowed POST must match the sign-in address EXACTLY, query included; if the real form posts elsewhere the
-    # reader stops (fails closed) and says so, rather than letting some other POST through.
-    if method == 'POST' and parts.path == login.path and parse_qs(parts.query) == parse_qs(login.query) and not state.get('posted'):
+    # Nigri uses ONE page address for everything (sign-in, attendance, marks), told apart only by the query, so the single
+    # allowed POST must match the sign-in POST exactly (is_signin_post). Anything else stops the run and is reported.
+    if method == 'POST' and is_signin_post(url) and not state.get('posted'):
         state['posted'] = True
         return True
     return False
 
 
 def install_read_only_guard(page):
-    state = {'posted': False, 'blocked': [], 'blocked_detail': []}
+    state = {'posted': False, 'blocked': [], 'blocked_detail': [], 'tracking_blocked': 0}
 
     def handler(route):
         req = route.request
         if req.resource_type in SKIP_TYPES:
+            return route.abort()
+        if is_tracking(req.url):   # analytics/ads scripts: dropped quietly, never a failure
+            state['tracking_blocked'] += 1
             return route.abort()
         if allow_request(req.method, req.url, state):
             return route.continue_()
@@ -55,6 +84,11 @@ def install_read_only_guard(page):
         return route.abort()
     page.route('**/*', handler)
     return state
+
+
+def blocked_writes(state):
+    """Blocked requests that were not plain reads: the only ones that make a run fail."""
+    return [d for d in state['blocked_detail'] if not d.startswith('GET ')]
 
 
 SAFE_QUERY = {'section', 'subSection', 'side'}   # page-type words only; every other value is hidden
@@ -180,8 +214,8 @@ def login_and_read(username, password, launch):
         if page.query_selector('input[name="password"]') and not any(f.query_selector(PICKER) for f in page.frames):
             raise ReaderError('Nigri did not accept the sign-in.')
         raw = read_picker(page)
-        if state['blocked']:
-            raise ReaderError('Stopped: a non-read request was blocked (%s).' % ', '.join(sorted(set(state['blocked']))))
+        if blocked_writes(state):
+            raise ReaderError('Stopped: a non-read request was blocked (%s).' % ', '.join(sorted({d.split(' ')[0] for d in blocked_writes(state)})))
         return raw
     finally:
         close()
@@ -202,7 +236,7 @@ def login_and_inspect(username, password, launch):
         except Exception:
             pass
         structure = inspect_page(page)
-        verdict, sentence = sign_in_verdict(state['posted'], state['blocked_detail'], structure)
+        verdict, sentence = sign_in_verdict(state['posted'], blocked_writes(state), structure)
         picker = None
         for frame in page.frames:
             try:
@@ -212,7 +246,7 @@ def login_and_inspect(username, password, launch):
                     break
             except Exception:
                 continue
-        return {'signIn': verdict, 'signInDetail': sentence, 'blockedRequests': state['blocked_detail'],
+        return {'signIn': verdict, 'signInDetail': sentence, 'blockedRequests': state['blocked_detail'], 'trackingScriptsDropped': state['tracking_blocked'],
                 'pages': structure, 'classPickerFound': picker is not None, 'courses': picker}
     finally:
         close()

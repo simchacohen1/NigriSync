@@ -31,6 +31,8 @@ def describe_field(f):
 def show(result):
     print('\n==== SIGN-IN: %s ====' % result['signIn'])
     print(result['signInDetail'])
+    if result.get('trackingScriptsDropped'):
+        print('(%d analytics/tracking scripts were quietly skipped. That is normal and not a problem.)' % result['trackingScriptsDropped'])
     for i, page in enumerate(result['pages']):
         print('\n%s %d' % ('Page' if i == 0 else 'Frame', i))
         print('  title:   %s' % (page.get('title') or '(none)'))
