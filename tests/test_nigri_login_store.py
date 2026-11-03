@@ -244,12 +244,12 @@ class NoPlaintextInSourceTests(unittest.TestCase):
         for word in ('print(', 'logging', 'logger', 'app.logger'):
             self.assertNotIn(word, text)
 
-    def test_no_route_uses_the_store_yet(self):
-        """Step 1 has no teacher-facing change: nothing but this module and its test may use it."""
+    def test_only_the_teacher_login_routes_use_the_store(self):
+        """Only the teacher-login routes (step 2) may use the store; the sync code must not reach it yet."""
         root = Path(S.__file__).parent
         users = [p.name for p in root.glob('*.py') if p.name != 'nigri_login_store.py'
                  and 'nigri_login_store' in p.read_text(encoding='utf-8')]
-        self.assertEqual(users, [])
+        self.assertEqual(users, ["nigri_login_routes.py"])
 
 
 if __name__ == '__main__':

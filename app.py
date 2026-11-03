@@ -29,7 +29,11 @@ from nigri_playwright import (
 from attendance_reader import read_attendance
 
 app = Flask(__name__)
+from nigri_login_routes import bp as nigri_login_bp
+app.register_blueprint(nigri_login_bp)   # answers 404 unless NIGRI_LOGIN_ENABLED=1
 CORS(app, resources={
+    r"/nigri-login": {"origins": ["https://simchacohen1.github.io", "https://funtorahtools.com", "https://www.funtorahtools.com", "https://funtorahtools.org", "https://www.funtorahtools.org", "https://fun-torah-tools-staging.web.app"],
+                      "methods": ["GET", "PUT", "DELETE", "OPTIONS"], "allow_headers": ["Authorization", "Content-Type"]},
     r"/classtime/.*": {"origins": ["https://simchacohen1.github.io", "https://funtorahtools.com", "https://www.funtorahtools.com", "https://funtorahtools.org", "https://www.funtorahtools.org"]},
     r"/(?!classtime/).*": {"origins": "*"},  # Preserve existing Attendance/Weekly Quiz behavior.
 })
@@ -38,7 +42,7 @@ CORS(app, resources={
 # Their authentication and Nigri behavior are unchanged; a busy service returns 409.
 @app.before_request
 def serialize_existing_browser_routes():
-    if request.path in ('/health',) or request.path.startswith('/classtime/') or request.method == 'OPTIONS': return
+    if request.path in ('/health', '/nigri-login') or request.path.startswith('/classtime/') or request.method == 'OPTIONS': return
     from browser_runtime import browser_slot
     from flask import g
     slot = browser_slot()
