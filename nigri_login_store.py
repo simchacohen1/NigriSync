@@ -165,6 +165,12 @@ class FirebaseRestBackend:
     def delete(self, uid):
         self._check(self._http().delete(self._url(uid), timeout=15))
 
+    def read_path(self, path):
+        """Read one value elsewhere in the database (used to check that a signed-in person is an active teacher)."""
+        if not re.fullmatch(r'[A-Za-z0-9_/-]{1,300}', path) or '..' in path:
+            raise LoginStoreError('Invalid path')
+        return self._check(self._http().get('%s/%s.json' % (self.base, path), timeout=15)).json()
+
 
 class NigriLoginStore:
     def __init__(self, backend, keyring):

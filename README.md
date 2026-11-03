@@ -107,3 +107,9 @@ keeps only the scrambled text in Firebase at `b3Private/nigriLogins/<teacherUid>
 rules). Render settings, all secret: `NIGRI_LOGIN_KEYS` (`id:base64key`, first one encrypts, others still open old
 records; make one with `openssl rand -base64 32`), `FIREBASE_SERVICE_ACCOUNT_JSON`, `FIREBASE_DATABASE_URL`.
 Tests use made-up names and mock storage only: `python -m unittest tests.test_nigri_login_store`.
+
+### Teacher login routes (issue 550, step 2)
+`GET/PUT/DELETE /nigri-login` (nigri_login_routes.py): a signed-in, active teacher sees whether a login is saved
+(plus the last 4 letters of the username), saves/replaces it, or removes it. Answers 404 unless `NIGRI_LOGIN_ENABLED=1`.
+`FIREBASE_PROJECT_ID` (default `b3-games`) says which Firebase project's sign-ins and teacher list to trust, so a
+staging copy uses `fun-torah-tools-staging`. It never contacts Nigri and the old shared key does not open it.
