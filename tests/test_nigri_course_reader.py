@@ -266,8 +266,9 @@ class SourceRulesTests(unittest.TestCase):
             if isinstance(node, (ast.Module, ast.FunctionDef, ast.ClassDef)) and node.body and isinstance(node.body[0], ast.Expr)                     and isinstance(getattr(node.body[0], 'value', None), ast.Constant) and isinstance(node.body[0].value.value, str):
                 node.body.pop(0) if len(node.body) > 1 else node.body.__setitem__(0, ast.Pass())
         code = ast.unparse(tree)
-        for word in ('#attend', 'attend', 'student', 'marks', 'select_option', '.check(', '.type(', 'press('):
-            self.assertNotIn(word, code.lower(), word)
+        for banned in ('attend_', 'input[name^', 'select_option', '.check(', '.type(', 'press(', '.content(', 'inner_text', 'text_content',
+                       'locator(', 'expand', 'screenshot', 'page.frame(', 'set_input_files', 'dispatch_event', '.submit('):
+            self.assertNotIn(banned, code.lower() if banned != 'page.frame(' else code, banned)
         self.assertEqual(len(re.findall(r'\.click\(', code)), 2)   # the sign-in button, once in each of the two flows
         self.assertEqual(len(re.findall(r'\.fill\(', code)), 4)   # username + password, once in each flow
 
@@ -292,7 +293,12 @@ class InspectFrame(Frame):
         super().__init__(options)
         self.url, self.info = url, info
 
+    links = ()
+    name = ''
+
     def evaluate(self, js):
+        if js == R.LINKS_JS:
+            return list(self.links)
         assert js == R.STRUCTURE_JS
         return dict(self.info)
 
@@ -361,6 +367,114 @@ class InspectTests(unittest.TestCase):
         res, _ = self.run_inspect([Bad(GOOD + '/x', HOME)])
         self.assertTrue(res['pages'][0]['unreadable'])
         self.assertNotIn(PW, str(res))
+
+
+ATT = GOOD + '/main/default_os_prog.asp?section=teachers&subSection=attendance&side=1'
+DASH_LINKS = [{'text': 'attendance', 'href': ATT}, {'text': 'moshe levi', 'href': GOOD + '/main/default_os_prog.asp?section=teachers&childID=42'},
+              {'text': 'tests', 'href': GOOD + '/main/default_os_prog.asp?section=teachers&subSection=tests&side=1'},
+              {'text': 'attendance', 'href': 'https://evil.example.test/attendance'}]
+ATT_INFO = {'title': 'Attendance', 'hasPasswordField': False, 'frames': [{'id': 'attend', 'name': 'attend', 'src': '/main/att.asp?classID=28734'}],
+            'fields': [{'tag': 'select', 'type': 'select-one', 'id': 'selNewCours', 'name': 'selNewCours', 'optionCount': 4,
+                        'optionsMatchingClassNames': 4, 'optionsWithNumericValue': 4}]}
+
+
+class NavPage(InspectPage):
+    """Dashboard first; goto(ATT) swaps in the attendance page (picker + a student-list frame that must never be read)."""
+
+    def __init__(self, dash_frames, att_frames, **kw):
+        super().__init__(dash_frames, **kw)
+        self.att_frames, self.visited = att_frames, []
+
+    def goto(self, url):
+        self.actions.append(('goto', url))
+        self.visited.append(url)
+        if url == ATT:
+            r = Route(Req('GET', url)); self.handler(r); self.results.append(('GET', r.result))
+            if r.result == 'continue':
+                self.frames = self.att_frames
+
+
+class StudentListFrame(InspectFrame):
+    name = 'attend'
+
+    def evaluate(self, js): raise AssertionError('the student attendance list must never be read')
+    def query_selector(self, sel): raise AssertionError('the student attendance list must never be queried')
+
+
+class AttendanceNavigationTests(unittest.TestCase):
+    def frames(self, links=DASH_LINKS):
+        dash = InspectFrame(GOOD + '/main/default_os_prog.asp?section=teachers&subSection=dashboard&side=1', HOME)
+        dash.links = links
+        att_main = InspectFrame(ATT, ATT_INFO, options=RAW)
+        return dash, att_main
+
+    def run_nav(self, links=DASH_LINKS):
+        dash, att = self.frames(links)
+        page = NavPage([dash], [att, StudentListFrame(GOOD + '/main/att.asp?classID=28734', {})])
+        launch, closed = launcher(page)
+        return R.login_and_inspect(USER, PW, launch), page, closed
+
+    def test_goes_to_the_attendance_page_with_a_plain_read_and_finds_the_picker(self):
+        res, page, closed = self.run_nav()
+        self.assertEqual(page.visited, [R.LOGIN_URL, ATT])   # sign-in page, then only the Attendance link
+        self.assertTrue(res['classPickerFound'])
+        self.assertEqual(len(res['courses']), 5)
+        self.assertEqual(res['attendancePages'][0]['title'], 'Attendance')
+        self.assertTrue(res['attendancePages'][1]['skipped'])          # the student frame is listed as skipped, never read
+        self.assertEqual(res['attendancePages'][1]['address'], '(student list frame, not read)')
+        self.assertIn('Followed the "Attendance" menu link', res['steps'][0])
+        self.assertEqual(res['blockedWrites'], [])
+        self.assertEqual(closed, [1])
+
+    def test_only_menu_words_are_reported_never_other_link_text(self):
+        res, _, _ = self.run_nav()
+        self.assertEqual(sorted(l['word'] for l in res['menuLinks']), ['attendance', 'attendance', 'tests'])
+        blob = str(res)
+        for secret in ('moshe levi', 'childID', PW, USER):
+            self.assertNotIn(secret, blob)
+
+    def test_picks_only_the_exact_attendance_link_on_nigri(self):
+        links = R.find_nav_links(types.SimpleNamespace(frames=[self.frames()[0]]))
+        self.assertEqual(R.pick_attendance_link(links)['href'], ATT)
+        for bad in ([{'word': 'attendance', 'href': 'https://evil.example.test/a'}],
+                    [{'word': 'attendance', 'href': GOOD + '/main/x.asp?section=teachers&action=del_test&testID=3'}],
+                    [{'word': 'attendance', 'href': 'javascript:void(0)'}], [{'word': 'tests', 'href': ATT}], []):
+            self.assertIsNone(R.pick_attendance_link(bad))
+
+    def test_no_attendance_link_means_nothing_else_is_opened(self):
+        res, page, _ = self.run_nav(links=[{'text': 'tests', 'href': GOOD + '/main/x.asp?section=teachers&subSection=tests'}])
+        self.assertEqual(page.visited, [R.LOGIN_URL])
+        self.assertFalse(res['classPickerFound'])
+        self.assertIn('nothing else was opened', res['steps'][0])
+        self.assertEqual(res['attendancePages'], [])
+
+    def test_the_student_list_frame_is_never_evaluated_even_if_it_is_on_the_first_page(self):
+        dash, _ = self.frames()
+        page = InspectPage([dash, StudentListFrame(GOOD + '/main/att.asp', {})])
+        launch, _ = launcher(page)
+        res = R.login_and_inspect(USER, PW, launch)    # StudentListFrame raises if touched
+        self.assertTrue(any(p.get('skipped') for p in res['pages']))
+
+
+class RiskyGetTests(unittest.TestCase):
+    def test_action_style_addresses_are_refused_even_as_gets(self):
+        base = GOOD + '/main/default_os_prog.asp?section=teachers&'
+        for q in ('spec=tests&action=del_test&testID=9', 'action=edit_test&testID=1', 'delete=1', 'Save=1', 'logout=1', 'send=1', 'add=1'):
+            self.assertTrue(R.is_risky_get(base + q), q)
+            self.assertFalse(R.allow_request('GET', base + q, {}), q)
+        for q in ('subSection=attendance&side=1', 'subSection=dashboard&side=1', 'spec=tests&testID=9'):
+            self.assertFalse(R.is_risky_get(base + q), q)
+            self.assertTrue(R.allow_request('GET', base + q, {}), q)
+
+    def test_a_risky_get_is_aborted_labelled_and_counts_as_a_stopped_write(self):
+        page = FakePage(RAW)
+        state = R.install_read_only_guard(page)
+        r = Route(Req('GET', GOOD + '/main/default_os_prog.asp?section=teachers&action=del_test&testID=77')); page.handler(r)
+        self.assertEqual(r.result, 'abort')
+        self.assertEqual(state['blocked_detail'], ['GET(risky) ' + GOOD + '/main/default_os_prog.asp?section=teachers&action=(hidden)&testID=(hidden)'])
+        self.assertEqual(R.blocked_writes(state), state['blocked_detail'])
+        r = Route(Req('GET', 'https://cdn.example.test/lib.js', 'script')); page.handler(r)
+        self.assertEqual(len(R.blocked_writes(state)), 1)   # a blocked outside GET is information only
 
 
 class SafeAddressTests(unittest.TestCase):

@@ -52,13 +52,23 @@ def is_signin_post(url):
     return all(len(v[0]) <= 200 and v[0].isprintable() for v in query.values())
 
 
+RISKY_KEYS = {'action', 'del', 'delete', 'remove', 'save', 'submit', 'update', 'edit', 'add', 'send', 'logout'}
+
+
+def is_risky_get(url):
+    """Nigri sometimes changes data through a plain address (e.g. action=del_test). Any address carrying an action-style
+    key is never fetched, even as a GET."""
+    keys = {k.lower() for k in parse_qs(urlsplit(str(url or '')).query, keep_blank_values=True)}
+    return bool(keys & RISKY_KEYS)
+
+
 def allow_request(method, url, state):
     """True if this request may go out. `state` is a dict used to allow exactly one sign-in POST."""
     parts = urlsplit(url)
     if parts.scheme != 'https' or parts.hostname not in NIGRI_HOSTS:
         return False
     if method == 'GET':
-        return True
+        return not is_risky_get(url)
     # Nigri uses ONE page address for everything (sign-in, attendance, marks), told apart only by the query, so the single
     # allowed POST must match the sign-in POST exactly (is_signin_post). Anything else stops the run and is reported.
     if method == 'POST' and is_signin_post(url) and not state.get('posted'):
@@ -80,7 +90,8 @@ def install_read_only_guard(page):
         if allow_request(req.method, req.url, state):
             return route.continue_()
         state['blocked'].append(req.method)
-        state['blocked_detail'].append(req.method + ' ' + safe_address(req.url))
+        risky = req.method == 'GET' and urlsplit(req.url).hostname in NIGRI_HOSTS   # a Nigri GET refused for its action-style key
+        state['blocked_detail'].append(req.method + ('(risky)' if risky else '') + ' ' + safe_address(req.url))
         return route.abort()
     page.route('**/*', handler)
     return state
@@ -154,6 +165,9 @@ def inspect_page(page):
     """Structure of the page and every frame: title, masked address, field/dropdown names. Read only."""
     out = []
     for frame in page.frames:
+        if getattr(frame, 'name', '') == 'attend':   # the student attendance list: never read at all
+            out.append({'title': None, 'hasPasswordField': False, 'fields': [], 'frames': [], 'address': '(student list frame, not read)', 'skipped': True})
+            continue
         try:
             info = frame.evaluate(STRUCTURE_JS)
         except Exception:
@@ -221,6 +235,62 @@ def login_and_read(username, password, launch):
         close()
 
 
+# Menu words only: link texts outside this list are never read or reported (they could be student names).
+NAV_WORDS = ('attendance', 'dashboard', 'tests', 'rewards', 'messages', 'calendar', 'reports', 'students', 'classes', 'courses',
+             'schedule', 'home', 'settings', 'profile', 'help', 'grades', 'marks', 'homework', 'documents', 'topics', 'lessons')
+LINKS_JS = r"""() => [...document.querySelectorAll('a[href]')].slice(0, 300).map(a => ({text: (a.textContent || '').trim().slice(0, 30).toLowerCase(), href: a.href}))"""
+
+
+def find_nav_links(page):
+    """Menu links on the page (and its frames), by menu word only: [{word, address(masked), href(full, internal use)}]."""
+    found = []
+    for frame in page.frames:
+        if getattr(frame, 'name', '') == 'attend':
+            continue
+        try:
+            links = frame.evaluate(LINKS_JS)
+        except Exception:
+            continue
+        for link in links or []:
+            word = str(link.get('text') or '')
+            href = str(link.get('href') or '')
+            if word in NAV_WORDS and href:
+                found.append({'word': word, 'href': href, 'address': safe_address(href)})
+    return found
+
+
+def pick_attendance_link(links):
+    """The exact 'Attendance' menu link, only if it is a plain Nigri address with no action-style key."""
+    for link in links:
+        parts = urlsplit(link['href'])
+        if link['word'] == 'attendance' and parts.scheme == 'https' and parts.hostname in NIGRI_HOSTS and not is_risky_get(link['href']):
+            return link
+    return None
+
+
+def read_picker_options(page):
+    for frame in page.frames:
+        try:
+            if frame.query_selector(PICKER):
+                return parse_options(frame.eval_on_selector_all(
+                    PICKER + ' option', 'els => els.map(o => ({value: o.value, name: (o.textContent || "").trim()}))'))
+        except Exception:
+            continue
+    return None
+
+
+def wait_for_picker(page, tries=10, ms=800):
+    for _ in range(tries):
+        options = read_picker_options(page)
+        if options is not None:
+            return options
+        try:
+            page.wait_for_timeout(ms)
+        except Exception:
+            break
+    return None
+
+
 def login_and_inspect(username, password, launch):
     """For the owner's own check: sign in once, then report the verdict and the page structure (names only)."""
     page, close = launch()
@@ -237,17 +307,22 @@ def login_and_inspect(username, password, launch):
             pass
         structure = inspect_page(page)
         verdict, sentence = sign_in_verdict(state['posted'], blocked_writes(state), structure)
-        picker = None
-        for frame in page.frames:
-            try:
-                if frame.query_selector(PICKER):
-                    picker = parse_options(frame.eval_on_selector_all(
-                        PICKER + ' option', 'els => els.map(o => ({value: o.value, name: (o.textContent || "").trim()}))'))
-                    break
-            except Exception:
-                continue
-        return {'signIn': verdict, 'signInDetail': sentence, 'blockedRequests': state['blocked_detail'], 'trackingScriptsDropped': state['tracking_blocked'],
-                'pages': structure, 'classPickerFound': picker is not None, 'courses': picker}
+        picker = read_picker_options(page)
+        steps, extra_pages, nav_links = [], [], []
+        if verdict == 'SUCCEEDED' and picker is None:
+            nav_links = find_nav_links(page)
+            link = pick_attendance_link(nav_links)
+            if link is not None:
+                steps.append('Followed the "Attendance" menu link (plain page read): ' + link['address'])
+                page.goto(link['href'])   # a GET; the guard still refuses anything with an action-style key
+                page.wait_for_load_state('networkidle')
+                picker = wait_for_picker(page)
+                extra_pages = inspect_page(page)
+            else:
+                steps.append('No "Attendance" menu link was found on this page, so nothing else was opened.')
+        return {'signIn': verdict, 'signInDetail': sentence, 'blockedRequests': state['blocked_detail'], 'blockedWrites': blocked_writes(state), 'trackingScriptsDropped': state['tracking_blocked'],
+                'pages': structure, 'menuLinks': [{'word': l['word'], 'address': l['address']} for l in nav_links], 'steps': steps,
+                'attendancePages': extra_pages, 'classPickerFound': picker is not None, 'courses': picker}
     finally:
         close()
 

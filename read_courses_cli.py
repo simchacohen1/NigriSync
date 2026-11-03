@@ -3,10 +3,11 @@
     python read_courses_cli.py
 
 It asks for your Nigri username and password (typed here, hidden, never saved or printed), signs in once, and tells you
-plainly whether the sign-in worked. It then prints only: the page title, the page address (with hidden query values),
-and the NAMES of dropdowns and form fields. It never prints or saves student names, attendance, marks, dropdown choices,
-field values or your password. It cannot save, submit or change anything on Nigri. A copy of what it printed is written
-to nigri-structure-found.json next to this file.
+plainly whether the sign-in worked. It then prints only: page titles, page addresses (with hidden query values), and the
+NAMES of dropdowns and form fields. If the class picker is not on the first page it follows the "Attendance" menu link
+(a plain page read) and looks there. It never prints or saves student names, attendance, marks, dropdown choices, field
+values or your password, and it never reads the student attendance list. It cannot save, submit or change anything on
+Nigri. A copy of what it printed is written to nigri-structure-found.json next to this file.
 """
 import getpass
 import json
@@ -28,13 +29,12 @@ def describe_field(f):
     return '  - ' + ', '.join(bits)
 
 
-def show(result):
-    print('\n==== SIGN-IN: %s ====' % result['signIn'])
-    print(result['signInDetail'])
-    if result.get('trackingScriptsDropped'):
-        print('(%d analytics/tracking scripts were quietly skipped. That is normal and not a problem.)' % result['trackingScriptsDropped'])
-    for i, page in enumerate(result['pages']):
-        print('\n%s %d' % ('Page' if i == 0 else 'Frame', i))
+def show_pages(label, pages):
+    for i, page in enumerate(pages):
+        print('\n%s %d' % (label if i == 0 else 'Frame', i))
+        if page.get('skipped'):
+            print('  %s' % page['address'])
+            continue
         print('  title:   %s' % (page.get('title') or '(none)'))
         print('  address: %s' % page['address'])
         if page.get('unreadable'):
@@ -46,6 +46,26 @@ def show(result):
             print(describe_field(f))
         for sub in page.get('frames', []):
             print('  contains a frame: id=%s name=%s address=%s' % (sub.get('id'), sub.get('name'), sub.get('src')))
+
+
+def show(result):
+    print('\n==== SIGN-IN: %s ====' % result['signIn'])
+    print(result['signInDetail'])
+    if result.get('trackingScriptsDropped'):
+        print('(%d analytics/tracking scripts were quietly skipped. That is normal and not a problem.)' % result['trackingScriptsDropped'])
+    show_pages('Page (after sign-in)', result['pages'])
+    for step in result.get('steps', []):
+        print('\nNEXT STEP: %s' % step)
+    if result.get('menuLinks'):
+        print('Menu links seen (menu words only):')
+        for link in result['menuLinks']:
+            print('  %s -> %s' % (link['word'], link['address']))
+    if result.get('attendancePages'):
+        show_pages('Attendance page', result['attendancePages'])
+    if result.get('blockedWrites'):
+        print('\nSTOPPED REQUESTS (nothing was changed on Nigri):')
+        for w in result['blockedWrites']:
+            print('  ' + w)
     print('\nClass picker (select#selNewCours) found: %s' % ('YES' if result['classPickerFound'] else 'NO'))
     if result['courses'] is not None:
         report = R.summarize(result['courses'])
@@ -55,6 +75,12 @@ def show(result):
                 print('  FOUND    %-16s id %s' % (c['label'], c['courseId']))
             for c in g['missing']:
                 print('  MISSING  %-16s id %s' % (c['label'], c['courseId']))
+        if report['other']:
+            print('Other courses this login can see (not in our table):')
+            for o in report['other']:
+                print('  id %s  %s' % (o['id'], o['name']))
+        if report['noNumericId']:
+            print('Courses whose picker value was not a number: %d' % len(report['noNumericId']))
         result['courseSummary'] = report
 
 
