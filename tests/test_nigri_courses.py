@@ -195,6 +195,7 @@ class RouteTests(unittest.TestCase):
         self.backend = S.MemoryBackend()
         R._store = S.NigriLoginStore(self.backend, S.load_keyring(KEY))
         R._teacher_check = lambda uid: uid in (T1, T2)
+        R._school_check = lambda uid, claims: {'allowed': True, 'reason': 'ok', 'reset_at': None}
         R._reader = db()
         R._lister = lambda c: ET_ALL + ROOMS
         R._hits.clear()
@@ -205,7 +206,7 @@ class RouteTests(unittest.TestCase):
 
     def tearDown(self):
         for p in self.patches: p.stop()
-        R._store = R._teacher_check = R._reader = R._lister = None
+        R._store = R._teacher_check = R._school_check = R._reader = R._lister = None
 
     def get(self, cls, token='t1'):
         return self.c.get('/nigri-courses?class=' + cls, headers={'Authorization': 'Bearer ' + token} if token else {})

@@ -195,6 +195,15 @@ class NigriLoginStore:
         self.backend.delete(_check_uid(uid))
         return {'saved': False}
 
+    def drop_if_saved_before(self, uid, reset_at):
+        """The owner moved him to another school (reset_at, ms): a login saved before that is deleted. True if dropped."""
+        from nigri_school_access import login_was_reset
+        record = self.backend.get(_check_uid(uid))
+        if record is not None and login_was_reset(record, reset_at):
+            self.backend.delete(uid)
+            return True
+        return False
+
     def get_credentials(self, uid):
         """Server-internal only (the sync code). Never return this from a route."""
         record = self.backend.get(_check_uid(uid))

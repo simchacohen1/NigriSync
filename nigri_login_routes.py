@@ -4,6 +4,8 @@ Off unless NIGRI_LOGIN_ENABLED=1, so deploying this code changes nothing by itse
 stores the encrypted login (nigri_login_store). Responses carry only {saved, hint, updatedAt}, never a password.
 Settings (Render): NIGRI_LOGIN_ENABLED, FIREBASE_PROJECT_ID (default b3-games; staging uses its own project),
 NIGRI_LOGIN_WORKSPACE (default b3-2026), plus the store settings (NIGRI_LOGIN_KEYS, FIREBASE_*).
+Schools (B3-games#631): every request also needs the caller's school to have "Syncs to Nigri" on, or the caller to be
+the owner (NIGRI_OWNER_EMAIL, default the production owner; staging sets its own). See nigri_school_access.py.
 """
 import hmac
 import os
@@ -13,6 +15,7 @@ import time
 from flask import Blueprint, jsonify, request
 
 from nigri_login_store import LoginStoreError, store_from_environment
+import nigri_school_access as A
 
 bp = Blueprint('nigri_login', __name__)
 _lock = threading.Lock()
@@ -20,7 +23,8 @@ _hits = {}
 LIMIT, WINDOW = 12, 60   # at most 12 requests per teacher per minute
 MAX_BODY = 2048
 _store = None
-_teacher_check = None   # tests replace these two; production builds them from the environment
+_teacher_check = None   # tests replace these three; production builds them from the environment
+_school_check = None
 
 
 def enabled():
@@ -56,17 +60,40 @@ def _get_store():
     return _store
 
 
-def teacher_uid():
-    """Verified Google sign-in of an active teacher, else None. The old shared key never counts here."""
+def owner_email():
+    return os.environ.get('NIGRI_OWNER_EMAIL', A.OWNER_EMAIL)
+
+
+def _caller():
+    """(uid, claims) of a verified Google sign-in, else (None, None). The old shared key never counts here."""
     header = request.headers.get('Authorization', '')
     if not header.startswith('Bearer '):
-        return None
+        return None, None
     try:
         claims = _verify_token(header[7:])
         uid = claims and claims.get('sub')
-        return uid if uid and _is_teacher(uid) else None
+        return (uid, claims) if uid else (None, None)
+    except Exception:
+        return None, None
+
+
+def teacher_uid():
+    """Verified Google sign-in of the owner or an active teacher, else None."""
+    uid, claims = _caller()
+    if not uid:
+        return None
+    try:
+        return uid if A.is_owner(claims, owner_email()) or _is_teacher(uid) else None
     except Exception:
         return None
+
+
+def _school_access(uid, claims):
+    """May he use Nigri? His school must have "Syncs to Nigri" on (nigri_school_access). Checked on every request."""
+    if _school_check is not None:
+        return _school_check(uid, claims)
+    workspace = os.environ.get('NIGRI_LOGIN_WORKSPACE', 'b3-2026')
+    return A.nigri_access(_read_path, workspace, uid, claims, owner_email())
 
 
 def _limited(uid):
@@ -93,11 +120,32 @@ def _gate():
         return None
     if not enabled():
         return _reply({'error': 'not found'}, 404)
-    uid = teacher_uid()
-    if not uid:
+    uid, claims = _caller()
+    try:
+        allowed_person = bool(uid) and (A.is_owner(claims, owner_email()) or _is_teacher(uid))
+    except Exception:
+        allowed_person = False
+    if not allowed_person:
         return _reply({'error': 'unauthorized'}, 401)
     if _limited(uid):
         return _reply({'error': 'Too many tries. Wait a minute.'}, 429)
+    try:
+        access = _school_access(uid, claims)
+    except Exception:
+        return _reply({'error': 'Could not check right now.'}, 500)
+    # Removing his own saved login is always allowed; everything else needs a school that syncs to Nigri.
+    removing = request.method == 'DELETE' and request.path == '/nigri-login'
+    if not access.get('allowed') and not removing:
+        if access.get('reason') == 'not_teacher':
+            return _reply({'error': 'unauthorized'}, 401)
+        reason = access.get('reason', 'school_off')
+        return _reply({'error': A.MESSAGES.get(reason, A.MESSAGES['school_off']), 'code': reason}, 403)
+    # Moved to another school by the owner: a login saved before the move is deleted, never used.
+    if access.get('reset_at'):
+        try:
+            _get_store().drop_if_saved_before(uid, access['reset_at'])
+        except LoginStoreError as exc:
+            return _reply({'error': str(exc)}, 500)
     request.environ['nigri_login_uid'] = uid
     return None
 
