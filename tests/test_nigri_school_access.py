@@ -181,5 +181,69 @@ class RouteTests(unittest.TestCase):
                 self.assertNotIn(PW, self.call(method, uid).get_data(as_text=True))
 
 
+class SyncMarksTests(RouteTests):
+    """/sync-marks: owner and old key unchanged; a teacher syncs with HIS OWN login only if his school syncs."""
+    BODY = {'class_section': 'B3 ET', 'topic': 'Chumash', 'test_name': 'Made-up quiz', 'students': [{'name': 'Fake Boy', 'mark': 9}]}
+
+    def setUp(self):
+        super().setUp()
+        self.calls = []
+        def fake_run(**kw):
+            self.calls.append(kw)
+            return {'test_id': 'fake-1'}
+        import contextlib
+        self.patches2 = [patch.object(server, 'run_marks_sync', fake_run),
+                         patch.object(server, 'SYNC_API_KEY', 'test-key-123'),   # another test module may import app first
+                         patch('browser_runtime.browser_slot', contextlib.nullcontext),   # the real lock needs Linux fcntl
+                         patch('classtime_auth.review_owner', lambda allow_diagnostic=True: 'owner-uid' if
+                               server.request.headers.get('Authorization') == 'Bearer ' + OWNER else None)]
+        for p in self.patches2: p.start()
+
+    def tearDown(self):
+        for p in self.patches2: p.stop()
+        super().tearDown()
+
+    def sync(self, uid=None, key=None):
+        headers = {'Authorization': 'Bearer ' + uid} if uid else {}
+        if key: headers['X-Sync-Key'] = key
+        return self.c.post('/sync-marks', json=self.BODY, headers=headers)
+
+    def test_old_key_and_owner_still_use_the_service_account(self):
+        self.assertEqual(self.sync(key='test-key-123').status_code, 200)
+        self.assertEqual(self.sync(uid=OWNER).status_code, 200)
+        self.assertEqual([c['credentials'] for c in self.calls], [None, None])
+
+    def test_teacher_syncs_with_his_own_login(self):
+        self.store.save(ON, USER, PW)
+        r = self.sync(uid=ON)
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual((self.calls[0]['credentials'].username, self.calls[0]['credentials'].password), (USER, PW))
+        self.assertNotIn(PW, r.get_data(as_text=True))
+
+    def test_teacher_without_a_saved_login_is_told_to_connect(self):
+        r = self.sync(uid=ON)
+        self.assertEqual((r.status_code, r.get_json()['code']), (409, 'no_login'))
+        self.assertEqual(self.calls, [])
+
+    def test_teacher_in_school_with_sync_off_is_refused_even_with_a_saved_login(self):
+        self.store.save(OFF, USER, PW)
+        r = self.sync(uid=OFF)
+        self.assertEqual((r.status_code, r.get_json()['code']), (403, 'school_off'))
+        self.assertEqual(self.calls, [])
+
+    def test_moved_teacher_cannot_sync_with_his_old_login(self):
+        self.store.save(MOVED, USER, PW, now=1)
+        self.assertEqual(self.sync(uid=MOVED).status_code, 409)
+        self.assertEqual(self.calls, [])
+
+    def test_strangers_and_feature_off_are_unauthorized(self):
+        self.store.save(ON, USER, PW)
+        self.assertEqual(self.sync(uid=ALIEN).status_code, 401)
+        self.assertEqual(self.sync().status_code, 401)
+        with patch.dict(os.environ, {'NIGRI_LOGIN_ENABLED': '0'}):
+            self.assertEqual(self.sync(uid=ON).status_code, 401)
+        self.assertEqual(self.calls, [])
+
+
 if __name__ == '__main__':
     unittest.main()

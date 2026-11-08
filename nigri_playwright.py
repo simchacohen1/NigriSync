@@ -139,10 +139,11 @@ class SyncError(Exception):
         self.partial_results = partial_results or []
 
 
-def login(page):
+def login(page, credentials=None):
+    """credentials: a teacher's own saved login (has .username/.password, handed in by the route); None = the service's own account."""
     page.goto(NIGRI_LOGIN_URL)
-    page.fill('input[name="login"]', NIGRI_USERNAME)
-    page.fill('input[name="password"]', NIGRI_PASSWORD)
+    page.fill('input[name="login"]', credentials.username if credentials else NIGRI_USERNAME)
+    page.fill('input[name="password"]', credentials.password if credentials else NIGRI_PASSWORD)
     page.click('input[name="submit"]')
     page.wait_for_load_state("networkidle")
 
@@ -950,8 +951,11 @@ def run_marks_sync(
     test_date=None,
     description=None,
     mark_all_done=True,
+    credentials=None,
 ):
     """
+    credentials: the signed-in teacher's own Nigri login; None (owner / old key) = the service's own account.
+
     The real, production version of the School Marks push -- the quiz
     equivalent of run_sync() for attendance/points. One browser session:
       1. Create a new mark (header form): grade, topic, type, name, and
@@ -985,7 +989,7 @@ def run_marks_sync(
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
 
-        login(page)
+        login(page, credentials)
         page.goto(MARKS_URL)
         page.wait_for_load_state("networkidle")
 

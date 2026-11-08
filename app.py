@@ -487,7 +487,16 @@ def sync_marks():
     # This is the real, production endpoint -- it creates and saves a
     # real mark on the live Nigri site (it does NOT auto-delete). Use
     # /debug-marks-full first to test the whole flow safely.
-    if not nigri_authorized(): return jsonify({"error": "unauthorized"}), 401
+    #
+    # Who logs in to Nigri:
+    #   - the owner's sign-in or the old shared key -> the service's own account (unchanged);
+    #   - a teacher's sign-in -> HIS OWN saved Nigri login, only if his school has "Syncs to Nigri" on
+    #     (nigri_login_routes.teacher_sync_credentials). Nigri itself then limits him to what his account can reach.
+    credentials = None
+    if not nigri_authorized():
+        from nigri_login_routes import teacher_sync_credentials
+        credentials, refusal = teacher_sync_credentials()
+        if refusal: return refusal
 
     body = request.get_json(force=True, silent=True) or {}
 
@@ -529,6 +538,7 @@ def sync_marks():
             test_date=test_date,
             description=description,
             mark_all_done=mark_all_done,
+            credentials=credentials,
         )
         return jsonify({"status": "success", **result})
     except SyncError as e:

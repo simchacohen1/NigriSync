@@ -114,6 +114,42 @@ def _reply(body, status=200):
     return response, status
 
 
+def teacher_sync_credentials():
+    """For the real sync routes (e.g. /sync-marks) when the caller is a TEACHER, not the owner or the old key.
+    Returns (credentials, None) to log in to Nigri as him, or (None, (response, status)) to refuse.
+    Same rules as the login screen: active teacher, his school syncs to Nigri, his own saved login, checked every time.
+    Credentials never leave the server."""
+    if not enabled():
+        return None, _reply({'error': 'unauthorized'}, 401)
+    uid, claims = _caller()
+    try:
+        if not uid or not _is_teacher(uid):
+            return None, _reply({'error': 'unauthorized'}, 401)
+    except Exception:
+        return None, _reply({'error': 'unauthorized'}, 401)
+    if _limited(uid):
+        return None, _reply({'error': 'Too many tries. Wait a minute.'}, 429)
+    try:
+        access = _school_access(uid, claims)
+    except Exception:
+        return None, _reply({'error': 'Could not check right now.'}, 500)
+    if not access.get('allowed'):
+        if access.get('reason') == 'not_teacher':
+            return None, _reply({'error': 'unauthorized'}, 401)
+        reason = access.get('reason', 'school_off')
+        return None, _reply({'error': A.MESSAGES.get(reason, A.MESSAGES['school_off']), 'code': reason}, 403)
+    try:
+        store = _get_store()
+        if access.get('reset_at'):
+            store.drop_if_saved_before(uid, access['reset_at'])
+        credentials = store.get_credentials(uid)
+    except LoginStoreError as exc:
+        return None, _reply({'error': str(exc)}, 500)
+    if credentials is None:
+        return None, _reply({'error': 'Connect your Nigri account first.', 'code': 'no_login'}, 409)
+    return credentials, None
+
+
 @bp.before_request
 def _gate():
     if request.method == 'OPTIONS':
