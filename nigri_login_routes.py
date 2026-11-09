@@ -129,3 +129,34 @@ def login_remove():
         return _reply(_get_store().remove(request.environ['nigri_login_uid']))
     except LoginStoreError as exc:
         return _reply({'error': str(exc)}, 500)
+
+
+_reader = None   # tests replace these two; production reads Firebase and has no Nigri course reader yet
+_lister = None
+
+
+def _read_path(path):
+    if _reader is not None:
+        return _reader(path)
+    from nigri_login_store import FirebaseRestBackend
+    return FirebaseRestBackend().read_path(path)
+
+
+@bp.route('/nigri-courses', methods=['GET'])
+def course_matches():
+    """For one of his classes: its Nigri grade and which course IDs he may sync to (never lists shared rooms)."""
+    import nigri_courses as N
+    uid = request.environ['nigri_login_uid']
+    try:
+        try:
+            credentials = _get_store().get_credentials(uid)
+        except LoginStoreError:
+            credentials = None
+        workspace = os.environ.get('NIGRI_LOGIN_WORKSPACE', 'b3-2026')
+        result = N.course_status(_read_path, workspace, uid, request.args.get('class', ''), credentials,
+                                 _lister or N.default_lister())
+        return _reply(result)
+    except N.MatchError as exc:
+        return _reply({'error': exc.message, 'code': exc.code}, 403 if exc.code == 'not_your_class' else 400)
+    except Exception:
+        return _reply({'error': 'Could not check right now.'}, 500)
