@@ -1,5 +1,4 @@
 """The real save route, tested with a STAND-IN for run_marks_sync: nothing here can reach Nigri. Made-up names only."""
-import base64
 import os
 import sys
 import tempfile
@@ -27,11 +26,15 @@ class SyncError(Exception):
         super().__init__(message); self.partial_results = partial_results or []
 
 
-STATE = {'saves': [], 'titles': {'titles': ['Some Other Quiz'], 'discovered_ids': 1}, 'save_behavior': None, 'limits': [], 'browser_error': None}
+STATE = {'saves': [], 'attachments': [], 'titles': {'titles': ['Some Other Quiz'], 'discovered_ids': 1}, 'save_behavior': None, 'limits': [], 'browser_error': None}
 
 
 def stand_in_save(**kwargs):
     STATE['saves'].append(kwargs)
+    for item in kwargs['students']:
+        path = item.get('report_path')
+        if path:
+            STATE['attachments'].append((Path(path).name, Path(path).read_bytes()))
     if STATE['save_behavior']: return STATE['save_behavior'](kwargs)
     lines = ['Mark created (testID=4242)'] + [s['name'] + ': filled (attendance=' + s.get('attendance', 'present') + ')' for s in kwargs['students']] + ['Final Save! submitted']
     return {'test_id': '4242', 'results': lines}
@@ -90,8 +93,14 @@ class SaveTests(unittest.TestCase):
         for key in ('ann', 'ben', 'cal', 'dee'):
             path = Path(self.dir.name) / (key + '.pdf'); path.write_bytes(PDF); self.pdfs[key] = str(path)
         cr.JOBS.clear(); save.LEDGER.clear()
-        STATE.update(saves=[], titles={'titles': ['Some Other Quiz'], 'discovered_ids': 1}, save_behavior=None, limits=[], browser_error=None)
+        STATE.update(saves=[], attachments=[], titles={'titles': ['Some Other Quiz'], 'discovered_ids': 1}, save_behavior=None, limits=[], browser_error=None)
         self.add_review('rev1')
+        previous_pause = server.CLASSTIME_SAVES_PAUSED
+        previous_test_state = server.CLASSTIME_TEST_SAVE_STATE
+        server.CLASSTIME_SAVES_PAUSED = False  # Mock-only; no real Nigri writes.
+        server.CLASSTIME_TEST_SAVE_STATE = 'whole_class'  # Exercise the complete backend with a mocked Nigri writer.
+        self.addCleanup(setattr, server, 'CLASSTIME_SAVES_PAUSED', previous_pause)
+        self.addCleanup(setattr, server, 'CLASSTIME_TEST_SAVE_STATE', previous_test_state)
         self.client = server.app.test_client()
         patcher = patch('google.oauth2.id_token.verify_firebase_token', return_value=claims()); patcher.start(); self.addCleanup(patcher.stop)
         self.addCleanup(cr.JOBS.clear)
@@ -103,6 +112,14 @@ class SaveTests(unittest.TestCase):
         base = {'topic': 'Shoroshim', 'date': '2026-10-09'}
         return self.client.post('/classtime/reviews/' + rid + '/sync-save', json=base if body is None else {**base, **body}, headers=headers)
     def state(self, rid='rev1'): return (cr.JOBS[rid].get('save') or {}).get('state')
+
+    def test_new_production_pause_blocks_all_classtime_writes(self):
+        server.CLASSTIME_SAVES_PAUSED = True
+        response = self.post()
+        self.assertEqual(response.status_code, 423)
+        self.assertFalse(response.get_json()['saved'])
+        self.assertEqual(STATE['saves'], [])
+        self.assertIsNone(self.state())
 
     # ---- who may call it ----
     def test_only_the_owner_google_sign_in_works(self):
@@ -117,6 +134,17 @@ class SaveTests(unittest.TestCase):
             self.assertEqual(self.post().status_code, 401)
         self.assertEqual(STATE['saves'], []); self.assertIsNone(self.state())
 
+    def test_armed_authorization_allows_one_student_once_and_never_a_whole_class(self):
+        server.CLASSTIME_TEST_SAVE_STATE = 'armed'
+        self.assertEqual(self.post({}).status_code, 423)  # No whole-class bypass.
+        self.assertEqual(server.CLASSTIME_TEST_SAVE_STATE, 'armed')
+        self.assertEqual(self.post({'only_student': 'Ann Nigri'}).status_code, 200)
+        self.assertEqual(server.CLASSTIME_TEST_SAVE_STATE, 'consumed')
+        self.add_review('rev2', [student('Dee', 12)])
+        second = self.post({'only_student': 'Dee Nigri'}, rid='rev2')
+        self.assertEqual(second.status_code, 409)
+        self.assertEqual(len(STATE['saves']), 1)
+
     # ---- the normal full save ----
     def test_full_save_rebuilds_rows_on_the_server_and_attaches_pdfs(self):
         response = self.post({'students': [{'name': 'Hacker', 'mark': 100}], 'report_base64': 'AAAA', 'rows': 'x', 'mark_all_done': False})
@@ -125,11 +153,16 @@ class SaveTests(unittest.TestCase):
         self.assertEqual(len(STATE['saves']), 1); call = STATE['saves'][0]
         self.assertEqual((call['class_section'], call['topic'], call['mark_type'], call['test_date']), ('B3 ET', 'Shoroshim', 'quiz', '2026-10-09'))
         self.assertEqual(call['test_name'], 'Made Up Quiz (ABC123)'); self.assertTrue(call['mark_all_done'])
+        self.assertTrue(call['classtime_memory_saver'])  # Only Classtime saves use lighter Chromium
         rows = {s['name']: s for s in call['students']}
         self.assertEqual(set(rows), {'Ann Nigri', 'Ben Nigri', 'Dee Nigri'})            # unmatched boy never sent; browser rows ignored
         self.assertEqual((rows['Ann Nigri']['mark'], rows['Dee Nigri']['mark']), (75, 100))
         self.assertIsNone(rows['Ben Nigri']['mark']); self.assertEqual(rows['Ben Nigri']['attendance'], 'review')   # no score: blank, never 0
-        self.assertEqual(base64.b64decode(rows['Ann Nigri']['report_base64']), PDF); self.assertNotIn('report_base64', rows['Ben Nigri'])
+        self.assertNotIn('report_base64', rows['Ann Nigri'])
+        self.assertEqual(len(STATE['attachments']), 2)  # Each scored, matched boy gets his own file.
+        self.assertEqual({payload for _, payload in STATE['attachments']}, {PDF})
+        self.assertTrue(all(name.endswith('.pdf') for name, _ in STATE['attachments']))
+        self.assertNotIn('report_path', rows['Ben Nigri'])  # No score means no report upload.
         outcomes = {b['classtime_name']: b['outcome'] for b in data['per_boy']}
         self.assertEqual(outcomes, {'Ann': 'saved', 'Ben': 'left blank', 'Cal': 'skipped', 'Dee': 'saved'})
         self.assertEqual(self.state(), 'saved'); self.assertEqual(STATE['limits'][-1], 420)
@@ -164,6 +197,16 @@ class SaveTests(unittest.TestCase):
         self.assertTrue(call['test_name'].startswith('TEST DELETE ME')); self.assertIn('ABC123', call['test_name'])
         self.assertTrue(data['one_boy']); self.assertFalse(data['marking_done']); self.assertTrue(data['mark_name'].startswith('TEST DELETE ME'))
         self.assertEqual([(b['classtime_name'], b['outcome']) for b in data['per_boy']], [('Ann', 'saved')])   # only the chosen boy is reported
+
+    def test_sanitized_report_filename_collisions_keep_each_students_pdf_separate(self):
+        second = Path(self.dir.name) / 'ann-bang.pdf'; second.write_bytes(b'%PDF-1.4 second fictional report')
+        self.pdfs['ann!'] = str(second)
+        self.add_review('collision', [student('Ann', 9), student('Ann!', 12)])
+        response = self.post(rid='collision')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(STATE['attachments']), 2)
+        self.assertEqual({payload for _, payload in STATE['attachments']}, {PDF, second.read_bytes()})
+        self.assertEqual(len({name.casefold() for name, _ in STATE['attachments']}), 2)
     def test_one_boy_choices_are_checked(self):
         for bad in ('Nobody Nigri', 'Ben Nigri', 'Cal Nigri', 7, ''):
             self.assertEqual(self.post({'only_student': bad}).status_code, 400, bad)
@@ -176,28 +219,14 @@ class SaveTests(unittest.TestCase):
 
     # ---- duplicate check and the override ----
     def override(self, **extra): return {'allow_duplicate': True, 'confirm_session_code': 'ABC123', 'confirm_test_name': 'Made Up Quiz (ABC123)', **extra}
-    def test_duplicate_is_refused_without_the_override(self):
-        STATE['titles'] = {'titles': ['Made Up Quiz (ABC123)'], 'discovered_ids': 1}
-        out = self.post(); data = out.get_json()
-        self.assertEqual(out.status_code, 409); self.assertTrue(data['can_override']); self.assertEqual(data['duplicate_check']['status'], 'duplicate')
-        self.assertEqual(STATE['saves'], []); self.assertIsNone(self.state())
-        self.assertEqual(self.post({'allow_duplicate': 'yes'}).status_code, 409)       # must be exactly true
-    def test_override_needs_the_exact_code_and_name(self):
-        STATE['titles'] = {'titles': ['Made Up Quiz (ABC123)'], 'discovered_ids': 1}
-        for wrong in ({'confirm_session_code': 'ZZZ999'}, {'confirm_test_name': 'Other name'}, {'confirm_session_code': None}):
-            self.assertEqual(self.post(self.override(**wrong)).status_code, 400)
-        self.assertEqual(STATE['saves'], []); self.assertIsNone(self.state())
-        self.assertEqual(self.post(self.override()).status_code, 200); self.assertEqual(len(STATE['saves']), 1)
-    def test_could_not_check_also_needs_the_override(self):
-        for broken in (ValueError('Nigri login failed'), RuntimeError('boom'), {'titles': [], 'discovered_ids': 0}):
-            cr.JOBS.pop('rev1', None); self.add_review('rev1'); STATE['titles'] = broken; STATE['saves'] = []
-            out = self.post(); self.assertEqual(out.status_code, 409); self.assertEqual(out.get_json()['duplicate_check']['status'], 'could_not_check'); self.assertEqual(STATE['saves'], [])
-        self.assertEqual(self.post(self.override()).status_code, 200)
-    def test_override_for_a_one_boy_test_uses_the_test_name(self):
-        STATE['titles'] = {'titles': ['Made Up Quiz (ABC123)'], 'discovered_ids': 1}
-        name = 'TEST DELETE ME - Made Up Quiz (ABC123)'
-        self.assertEqual(self.post(self.override(only_student='Ann Nigri')).status_code, 400)             # the plain name is not the saved name
-        self.assertEqual(self.post(self.override(only_student='Ann Nigri', confirm_test_name=name)).status_code, 200)
+    def test_save_never_launches_the_nigri_duplicate_lookup(self):
+        with patch.object(stub, 'list_mark_titles', side_effect=AssertionError('duplicate browser must not run')) as lookup:
+            out = self.post({'only_student': 'Ann Nigri'})
+        self.assertEqual(out.status_code, 200)
+        lookup.assert_not_called()
+        self.assertEqual(len(STATE['saves']), 1)
+        self.assertEqual(STATE['saves'][0]['test_name'], 'TEST DELETE ME - Made Up Quiz (ABC123)')
+
     def test_pdf_problems_and_no_scores_can_never_be_overridden(self):
         STATE['titles'] = {'titles': ['Made Up Quiz (ABC123)'], 'discovered_ids': 1}
         self.add_review('rev1', [student('Ann', 9, pdf='missing'), student('Dee', 12)])

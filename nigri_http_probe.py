@@ -1,0 +1,811 @@
+"""Browser-free, read-only Nigri connectivity probe for the owner's Classtime page.
+
+Permitted network operations: GET login page, POST *only* the sign-in form,
+GET the teacher home and existing marks listing. NEVER submit Create Mark!, Save!, delete or
+upload. Never return passwords, cookies, hidden field values, HTML, or names.
+"""
+import os
+import re
+from html.parser import HTMLParser
+from urllib.parse import urljoin, urlsplit, parse_qsl
+
+import requests
+
+BASE = 'https://www.nigrijewishonlineschool.com'
+LOGIN_URL = BASE + '/main/default_os_prog.asp?section=teachers'
+MARKS_URL = BASE + '/main/default_os_prog.asp?section=teachers&subSection=tests&side=1'
+MAX_RESPONSE = 2 * 1024 * 1024
+HOST = 'www.nigrijewishonlineschool.com'
+
+
+def _safe_url(url):
+    parts = urlsplit(url)
+    if parts.scheme != 'https' or parts.hostname != HOST or parts.username or parts.password or parts.port not in (None, 443):
+        raise ValueError('Nigri redirected outside its approved HTTPS host; no further requests were made')
+    return url
+
+
+class _Page(HTMLParser):
+    """Collect structural metadata, never raw student information."""
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.forms = []
+        self.links = []
+        self._form = None
+        self._a = None
+        self.has_create_text = False
+        self._select = None
+        self.external_script_count = 0
+        self.inline_script_seen = False
+        self._inside_inline_script = False
+        self._inline_script_sample = ''
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if tag == 'form':
+            self._form = {'action': a.get('action', ''), 'method': (a.get('method') or 'get').lower(), 'inputs': []}
+            self._select = None
+            self.forms.append(self._form)
+        elif tag == 'input' and self._form is not None:
+            self._form['inputs'].append({
+                'name': a.get('name', ''), 'id': a.get('id', ''),
+                'type': (a.get('type') or 'text').lower(), 'value': a.get('value', ''),
+            })
+        elif tag == 'select' and self._form is not None:
+            field = {'name': a.get('name', ''), 'type': tag, 'value': '', 'options': []}
+            if field['name'] == 'testGradeID':
+                # Keep event text in memory for a whitelist-only summary;
+                # never return JavaScript, selectors, URLs, or field values.
+                field['onchange_hint'] = (a.get('onchange') or '')[:512]
+            self._form['inputs'].append(field)
+            # Never collect option values for other selects (which might
+            # contain names/student records); only these public mark selectors.
+            self._select = field if field['name'] in ('testGradeID', 'testTopicID') else None
+        elif tag == 'option' and self._select is not None:
+            # Ignore option labels; never return raw option values.
+            self._select['options'].append(a.get('value', ''))
+        elif tag == 'textarea' and self._form is not None:
+            self._form['inputs'].append({'name': a.get('name', ''), 'type': tag, 'value': ''})
+        elif tag == 'button' and self._form is not None and a.get('name'):
+            self._form['inputs'].append({'name': a['name'], 'type': a.get('type', 'submit').lower(), 'value': a.get('value', '')})
+        elif tag == 'script':
+            if a.get('src'):
+                self.external_script_count = min(self.external_script_count + 1, 100)
+            else:
+                self.inline_script_seen = True
+                self._inside_inline_script = True
+        elif tag == 'a':
+            self._a = {'href': a.get('href', ''), 'label': ''}
+            self.links.append(self._a)
+
+    def handle_data(self, data):
+        if self._inside_inline_script:
+            # Aggregate keywords only. Never retain or return script bodies.
+            snippet = data.lower()
+            if 'testgradeid' in snippet:
+                self._inline_script_sample += ' grade-event'
+            if 'testtopicid' in snippet:
+                self._inline_script_sample += ' topic-event'
+            if 'xmlhttprequest' in snippet or '.ajax(' in snippet or 'fetch(' in snippet:
+                self._inline_script_sample += ' ajax-keyword'
+            if '.post(' in snippet or "method:'post'" in snippet or 'method:"post"' in snippet:
+                self._inline_script_sample += ' post-keyword'
+            self._inline_script_sample = self._inline_script_sample[:512]
+        if 'create new mark' in data.lower():
+            self.has_create_text = True
+        if self._a is not None:
+            self._a['label'] += data[:200]
+
+    def handle_endtag(self, tag):
+        if tag == 'form':
+            self._form = None
+            self._select = None
+        if tag == 'select':
+            self._select = None
+        if tag == 'script':
+            self._inside_inline_script = False
+        if tag == 'a':
+            self._a = None
+
+
+def _page(response):
+    if len(response.content) > MAX_RESPONSE:
+        raise ValueError('Nigri returned an unusually large page; probe stopped')
+    parsed = _Page()
+    parsed.feed(response.text)
+    return parsed
+
+
+def _request(session, method, url, *, data=None, trace=None):
+    """Follow redirects only as same-host GETs; never replay a sign-in POST."""
+    url = _safe_url(url)
+    for _ in range(6):
+        response = session.request(method, url, data=data, timeout=(8, 20), allow_redirects=False)
+        if trace is not None:
+            trace.append(response.status_code)  # Status codes only; never URLs, cookies or page data.
+        if response.status_code in (301, 302, 303):
+            location = response.headers.get('Location')
+            if not location:
+                raise ValueError('Nigri returned an incomplete redirect')
+            url = _safe_url(urljoin(url, location))
+            method, data = 'GET', None
+            continue
+        if response.status_code in (307, 308):
+            raise ValueError('Nigri asked to repeat a request during redirect; probe stopped safely')
+        if response.status_code != 200:
+            raise ValueError('Nigri returned HTTP ' + str(response.status_code))
+        return response
+    raise ValueError('Too many Nigri redirects')
+
+
+def probe(*, inspect_blank_form=False):
+    """Read-only HTTP sign-in and marks listing, optionally followed by one allowlisted blank-form GET.
+
+    This path deliberately uses requests only; it never launches Chromium.
+    """
+    username = os.environ.get('NIGRI_USERNAME')
+    password = os.environ.get('NIGRI_PASSWORD')
+    if not username or not password:
+        return {'status': 'credentials_missing', 'nigri_writes': False}
+    with requests.Session() as session:
+        login = _page(_request(session, 'GET', LOGIN_URL))
+        candidates = [f for f in login.forms if {'login', 'password'}.issubset({x['name'] for x in f['inputs']})]
+        if len(candidates) != 1:
+            return {'status': 'login_form_not_found', 'login_form_count': len(candidates), 'nigri_writes': False}
+        form = candidates[0]
+        if form['method'] != 'post':
+            return {'status': 'unsupported_login_method', 'nigri_writes': False}
+        action = _safe_url(urljoin(LOGIN_URL, form['action'] or LOGIN_URL))
+        # Retain hidden form tokens solely in memory; never return/log them.
+        fields = {x['name']: x['value'] for x in form['inputs'] if x['name'] and x['type'] in ('hidden', 'submit')}
+        # Nigri uses an <input type="image" name="submit"> login button.
+        # A real click submits submit.x and submit.y, NOT a plain "submit"
+        # field. Classic ASP login handlers may depend on those coordinates.
+        image_buttons = [x for x in form['inputs'] if x['type'] == 'image' and x['name']]
+        if len(image_buttons) == 1:
+            fields[image_buttons[0]['name'] + '.x'] = '15'
+            fields[image_buttons[0]['name'] + '.y'] = '15'
+        fields.update(login=username, password=password)
+        post_trace, home_trace, marks_trace = [], [], []
+        login_response = _request(session, 'POST', action, data=fields, trace=post_trace)  # SIGN-IN ONLY
+        login_after_post = _page(login_response)
+        login_field_names = {'login', 'password'}
+        def has_login(page):
+            return any(login_field_names.issubset({i['name'] for i in f['inputs']}) for f in page.forms)
+        post_still_login = has_login(login_after_post)
+        cookies_after_post = len(session.cookies)  # Count only; never expose cookie names or values.
+        home = _page(_request(session, 'GET', LOGIN_URL, trace=home_trace))  # Read-only teacher home.
+        home_still_login = has_login(home)
+        # Check whether requests would attach the existing session cookie to the marks GET.
+        marks_has_cookie = bool(session.prepare_request(requests.Request('GET', MARKS_URL)).headers.get('Cookie'))
+        marks = _page(_request(session, 'GET', MARKS_URL, trace=marks_trace))
+        marks_still_login = has_login(marks)
+        create = [a for a in marks.links if 'create new mark' in a['label'].lower()]
+        field_names = {i['name'] for f in marks.forms for i in f['inputs']}
+        recognizable = bool(create or marks.has_create_text or {'testGradeID', 'testName', 'testDate'} & field_names)
+        diagnostics = {
+            'login_form_returned_after_post': post_still_login,
+            'login_form_at_teacher_home': home_still_login,
+            'login_form_at_marks': marks_still_login,
+            'image_button_submitted': len(image_buttons) == 1,
+            'cookies_after_login_count': cookies_after_post,
+            'cookies_sent_to_marks': marks_has_cookie,
+            'login_post_redirect_count': len(post_trace) - 1,
+            'teacher_home_redirect_count': len(home_trace) - 1,
+            'marks_redirect_count': len(marks_trace) - 1,
+            'marks_create_text_found': marks.has_create_text,
+            'nigri_writes': False,
+        }
+        # A login form in a shared header is not enough to prove login failure if
+        # the page also contains the authenticated marks controls.
+        if marks_still_login and not recognizable:
+            result = {'status': 'login_not_accepted', **diagnostics}
+            if inspect_blank_form:
+                result['blank_form'] = {'status': 'blank_form_marks_unconfirmed', 'nigri_writes': False}
+            return result
+        kind = 'none'
+        keys = []
+        if create:
+            href = create[0]['href']
+            kind = 'javascript' if href.lower().startswith('javascript:') else 'http_link'
+            if kind == 'http_link':
+                target = _safe_url(urljoin(MARKS_URL, href))
+                keys = sorted(set(k for k, _ in parse_qsl(urlsplit(target).query)))[:16]
+        result = {'status': 'marks_listing_found' if recognizable else 'marks_page_unconfirmed',
+                  **diagnostics, 'http_login_succeeded': recognizable, 'create_link_found': bool(create),
+                  'create_link_kind': kind, 'create_link_query_keys': keys,
+                  'form_count': len(marks.forms), 'nigri_writes': False}
+        if inspect_blank_form:
+            if recognizable:
+                result['blank_form'] = _probe_blank_mark_form(session, marks)
+            else:
+                result['blank_form'] = {'status': 'blank_form_marks_unconfirmed', 'nigri_writes': False}
+        return result
+
+
+
+def _mark_entry_readonly_summary(page):
+    """Inspect structure of the already-fetched marks listing. Zero extra HTTP requests.
+
+    We deliberately DO NOT follow the Create New Mark link here. A URL
+    advertised by a third-party site is not proof that GET is side-effect-free.
+    Return only a preapproved set of control names and query keys, never values.
+    """
+    from urllib.parse import urlsplit
+    known_fields = {
+        'testGradeID', 'testTopicID', 'testName', 'testDate',
+        'testDesc', 'testCompleted',
+    }
+    fields = {i.get('name', '') for f in page.forms for i in f.get('inputs', [])}
+    detected = sorted(known_fields & fields)
+    links = [a for a in page.links if 'create new mark' in a.get('label', '').lower()]
+    target_kind, query_keys, action_kind = 'not_found', [], 'unknown'
+    if links:
+        href = links[0]['href'].strip()
+        if href.lower().startswith('javascript:'):
+            target_kind = 'javascript'
+        elif href.startswith('#'):
+            target_kind = 'fragment'
+        else:
+            try:
+                absolute = _safe_url(urljoin(MARKS_URL, href))
+                query = parse_qsl(urlsplit(absolute).query, keep_blank_values=True)
+                query_keys = sorted({k for k, _ in query
+                                     if k in {'section', 'spec', 'action', 'subSection', 'side'}})
+                actions = [v.lower() for k, v in query if k == 'action']
+                if len(actions) == 1 and actions[0] in {
+                    'new_test', 'add_test', 'create_test', 'new', 'new_mark',
+                    'add', 'create', 'new_test_form',
+                }:
+                    action_kind = actions[0]
+                target_kind = 'same_host_http_link'
+            except ValueError:
+                target_kind = 'external_or_unsafe'
+    return {
+        'entry_link_kind': target_kind,
+        'entry_link_action_kind': action_kind,
+        'entry_link_query_keys': query_keys,
+        'known_form_field_names': detected,
+        'create_button_text_found': page.has_create_text,
+        'forms_on_listing': len(page.forms),
+        'entry_form_was_not_opened': True,
+    }
+
+
+def _hybrid_login_router(route):
+    """Skip Nigri login images/fonts/media only; preserve all functional requests."""
+    if route.request.resource_type in ('image', 'media', 'font', 'texttrack'):
+        return route.abort()
+    return route.continue_()
+
+
+# Only the already displayed "Create New Mark" link is eligible for the
+# new read-only form probe. Never guess a mark URL, follow a link with IDs,
+# or execute a GET with save/delete/submit/edit semantics.
+_SAFE_NEW_MARK_QUERY_KEYS = frozenset({
+    'section', 'subSection', 'spec', 'side', 'action', 'mode', 'task', 'view',
+})
+_SAFE_NEW_MARK_ACTIONS = frozenset({
+    'new', 'new_test', 'new_mark', 'new_test_form', 'form',
+})
+
+
+def _safe_blank_mark_url(marks):
+    links = [a for a in marks.links if 'create new mark' in a.get('label', '').lower()]
+    if len(links) != 1:
+        return None, 'link_missing_or_ambiguous'
+    href = links[0].get('href', '').strip()
+    if not href or href.startswith('#') or href.lower().startswith('javascript:'):
+        return None, 'link_not_a_get'
+    try:
+        target = _safe_url(urljoin(MARKS_URL, href))
+        bits = urlsplit(target)
+        if bits.path.lower() != '/main/default_os_prog.asp' or bits.fragment:
+            return None, 'link_unrecognized'
+        pairs = parse_qsl(bits.query, keep_blank_values=True)
+        if not pairs or len(pairs) > 9 or len(set(k for k, _ in pairs)) != len(pairs):
+            return None, 'link_unrecognized'
+        params = dict(pairs)
+        # Nigri's observed blank New Mark link contains exactly these six
+        # parameters. Permit this ONE form-opening GET only when all selector
+        # values are empty and testID is literally "0" (not an existing ID).
+        # Never broaden the normal allowlist to arbitrary IDs or actions.
+        observed_blank_keys = {
+            'section', 'spec',
+            'testCoursTypeSelect', 'testGradeSelect',
+            'testID', 'testTopicSelect',
+        }
+        if set(params) == observed_blank_keys:
+            if (params['section'] == 'teachers'
+                    and params['spec'] == 'tests'
+                    and params['testCoursTypeSelect'] == ''
+                    and params['testGradeSelect'] == ''
+                    and params['testID'] == '0'
+                    and params['testTopicSelect'] == ''):
+                return target, 'allowed_blank_new_mark_get'
+            return None, 'blank_new_mark_values_unexpected'
+        if set(params) - _SAFE_NEW_MARK_QUERY_KEYS:
+            return None, 'link_unrecognized'
+        if params.get('section', '').lower() != 'teachers':
+            return None, 'link_unrecognized'
+        if (params.get('spec', '').lower() != 'tests'
+                and params.get('subSection', '').lower() != 'tests'):
+            return None, 'link_unrecognized'
+        for key in ('action', 'mode', 'task', 'view'):
+            if key in params and params[key].lower() not in _SAFE_NEW_MARK_ACTIONS:
+                return None, 'link_unrecognized'
+        # A link back to the School Marks listing is NOT the New Mark form.
+        if target == MARKS_URL:
+            return None, 'link_is_listing'
+        return target, 'allowed'
+    except (ValueError, UnicodeError):
+        return None, 'link_unrecognized'
+
+
+# Preapproved parameter names that appear in the authenticated New Mark link.
+# They are NEVER sufficient authorization to follow that link.
+_NEW_MARK_SELECTION_PARAMS = (
+    'testCoursTypeSelect', 'testGradeSelect', 'testID', 'testTopicSelect',
+)
+
+
+def _safe_mark_parameter_kind(values):
+    """Classify without returning or logging user data or URL values."""
+    if len(values) != 1:
+        return 'repeated_or_missing'
+    value = values[0]
+    if value == '':
+        return 'blank'
+    if value == '0':
+        return 'zero'
+    if value.isascii() and value.isdecimal() and len(value) <= 12:
+        return 'nonzero_number'
+    return 'other_redacted'
+
+
+def _blank_mark_link_diagnostics(marks):
+    """Safe structural facts for a rejected Create New Mark link.
+
+    No GET/POST and never disclose URLs, query VALUES, unsafe-looking
+    parameter names, credentials, cookies or student information. Only
+    short, strictly filtered parameter identifiers can be returned.
+    """
+    links = [a for a in marks.links if 'create new mark' in a.get('label', '').lower()]
+    if len(links) != 1:
+        return {'link_count': 'none' if not links else 'multiple',
+                'no_navigation': True}
+    href = links[0].get('href', '').strip()
+    if href.lower().startswith('javascript:'):
+        return {'link_kind': 'javascript', 'no_navigation': True}
+    if href.startswith('#'):
+        return {'link_kind': 'fragment', 'no_navigation': True}
+    if not href:
+        return {'link_kind': 'empty', 'no_navigation': True}
+    try:
+        target = _safe_url(urljoin(MARKS_URL, href))
+        url = urlsplit(target)
+        pairs = parse_qsl(url.query, keep_blank_values=True)
+        params = dict(pairs)
+        keys = {k for k, _ in pairs}
+        known = sorted(keys & _SAFE_NEW_MARK_QUERY_KEYS)
+        # Group the original values locally; report only fixed categories.
+        grouped = {k: [v for x, v in pairs if x == k]
+                   for k in _NEW_MARK_SELECTION_PARAMS if k in keys}
+        parameter_kinds = {k: _safe_mark_parameter_kind(grouped[k])
+                           for k in _NEW_MARK_SELECTION_PARAMS if k in grouped}
+        # A nonzero testID could reference an existing mark; never inspect it
+        # as if it were a blank form.
+        test_id_kind = parameter_kinds.get('testID', 'missing')
+        may_reference_existing_mark = test_id_kind not in ('blank', 'zero')
+        # These are query PARAMETER NAMES ONLY, never their values. Reject
+        # names that could contain PII/credentials or non-identifier text.
+        # Return at most 8 short names; all others remain count-only.
+        unknown_keys = keys - _SAFE_NEW_MARK_QUERY_KEYS
+        sensitive_words = (
+            'pass', 'secret', 'token', 'auth', 'cookie', 'session',
+            'email', 'user', 'student', 'person', 'phone', 'key',
+            'credential', 'login', 'pin', 'jwt', 'bearer', 'csrf',
+        )
+        safe_names = sorted(
+            k for k in unknown_keys
+            if re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{0,29}', k)
+            and not any(word in k.lower() for word in sensitive_words)
+        )[:8]
+        action_flags = [k for k in ('action', 'mode', 'task', 'view')
+                        if k in params and params[k].lower() not in _SAFE_NEW_MARK_ACTIONS]
+        return {
+            'link_kind': 'same_host_https',
+            'expected_asp_path': url.path.lower() == '/main/default_os_prog.asp',
+            'has_fragment': bool(url.fragment),
+            'query_key_count': min(len(pairs), 20),
+            'recognized_query_keys': known,
+            'unknown_query_key_count': min(len(unknown_keys), 20),
+            'safe_unknown_parameter_names': safe_names,
+            'redacted_parameter_name_count': max(0, len(unknown_keys) - len(safe_names)),
+            'selection_parameter_kinds': parameter_kinds,
+            'test_id_may_reference_existing_mark': may_reference_existing_mark,
+            'has_duplicate_keys': len(pairs) != len(keys),
+            'section_is_teachers': params.get('section', '').lower() == 'teachers',
+            'tests_section_present': (params.get('spec', '').lower() == 'tests' or
+                                      params.get('subSection', '').lower() == 'tests'),
+            'unsupported_action_key_count': len(action_flags),
+            'is_marks_listing': target == MARKS_URL,
+            'no_navigation': True,
+        }
+    except (ValueError, UnicodeError):
+        return {'link_kind': 'other_host_or_invalid', 'no_navigation': True}
+
+
+def _header_form_structure(page, fetched_url):
+    """Only summarize the already-read blank form. NEVER submit or follow its action.
+
+    Strictly redact full action URL, query values, hidden values, student
+    information, cookie/token names and unexpected HTML field names.
+    """
+    required = {'testGradeID', 'testName'}
+    candidates = [
+        form for form in page.forms
+        if required.issubset({x.get('name') for x in form['inputs']})
+    ]
+    if len(candidates) != 1:
+        return {'status': 'header_form_missing_or_ambiguous',
+                'candidate_count': min(len(candidates), 10),
+                'form_not_submitted': True}
+    form = candidates[0]
+    method = form.get('method')
+    # HTML defaults to GET. It is not safe to infer POST if none is specified.
+    method_kind = method if method in ('get', 'post') else 'other'
+    raw_action = (form.get('action') or '').strip()
+    if not raw_action:
+        action_kind = 'current_blank_form_url'
+        action_query_keys = []
+        action_query_count = 0
+    elif raw_action.startswith('#') or raw_action.lower().startswith(('javascript:', 'data:')):
+        action_kind = 'script_or_fragment'
+        action_query_keys = []
+        action_query_count = 0
+    else:
+        try:
+            target = _safe_url(urljoin(fetched_url, raw_action))
+            parts = urlsplit(target)
+            action_kind = (
+                'same_host_teacher_asp' if parts.path.lower() == '/main/default_os_prog.asp'
+                else 'same_host_other_page'
+            )
+            pairs = parse_qsl(parts.query, keep_blank_values=True)
+            allowed = {'section', 'spec', 'subSection', 'side', 'submit',
+                       'testID', 'testGradeID', 'testTopicID'}
+            action_query_keys = sorted(set(key for key, _ in pairs if key in allowed))
+            action_query_count = min(len(pairs), 30)
+        except (ValueError, UnicodeError):
+            action_kind = 'external_or_untrusted'
+            action_query_keys = []
+            action_query_count = 0
+
+    recognized = {'testGradeID', 'testTopicID', 'testName',
+                  'testDate', 'testDesc', 'testType'}
+    names = {x.get('name') for x in form['inputs']}
+    submit_button = any(
+        x.get('type') in ('submit', 'image', 'button')
+        and x.get('value', '').strip() == 'Create Mark!'
+        for x in form['inputs']
+    )
+    return {
+        'status': 'header_form_structure_found',
+        'method': method_kind,
+        'action_kind': action_kind,
+        'action_recognized_query_keys': action_query_keys,
+        'action_query_parameter_count': action_query_count,
+        'recognized_fields_in_form': sorted(recognized & names),
+        'hidden_input_count': min(sum(x.get('type') == 'hidden'
+                                      for x in form['inputs']), 100),
+        'select_input_count': min(sum(x.get('type') == 'select'
+                                      for x in form['inputs']), 100),
+        'create_button_present': submit_button,
+        'form_not_submitted': True,
+        'real_post_endpoint_verified': False,
+        'real_post_result_verified': False,
+    }
+
+
+def _readonly_mark_form_dependencies(page):
+    """Read the *already fetched* blank form: no further Nigri requests.
+
+    Return only known grade/topic availability and aggregate hidden-field
+    categories. No hidden names/values, unknown option values or page HTML.
+    Class choice may cause AJAX; this DOES NOT infer successful topic refresh.
+    """
+    candidates = [
+        form for form in page.forms
+        if {'testGradeID', 'testName'}.issubset(
+            {i.get('name') for i in form['inputs']}
+        )
+    ]
+    if len(candidates) != 1:
+        return {
+            'status': 'form_ambiguous',
+            'read_only': True,
+            'no_grade_selected': True,
+            'no_ajax_called': True,
+        }
+    inputs = candidates[0]['inputs']
+    grade = [i for i in inputs if i.get('name') == 'testGradeID'
+             and i.get('type') == 'select']
+    topic = [i for i in inputs if i.get('name') == 'testTopicID'
+             and i.get('type') == 'select']
+    hidden = [i for i in inputs if i.get('type') == 'hidden']
+    # Use the IDs already confirmed by the existing browser-based Nigri
+    # integration; do not surface any other IDs or labels from this page.
+    grade_values = set(grade[0].get('options', [])) if len(grade) == 1 else set()
+    topic_values = set(topic[0].get('options', [])) if len(topic) == 1 else set()
+    blank_hidden_count = sum((h.get('value') or '') == '' for h in hidden)
+    zero_hidden_count = sum(h.get('value') == '0' for h in hidden)
+    # Anything else is classified only as "nonblank redacted" for privacy.
+    return {
+        'status': 'form_controls_observed',
+        'b3_et_option_present': '22590' in grade_values,
+        'b3_wt_option_present': '22453' in grade_values,
+        'shoroshim_topic_option_initially_present': '142' in topic_values,
+        'initial_grade_option_count': min(len(grade_values), 100),
+        'initial_topic_option_count': min(len(topic_values), 100),
+        'quiz_type_radio_present': any(
+            x.get('type') == 'radio'
+            and (x.get('value') == 'quiz' or x.get('id') == 'testType_quiz')
+            and (x.get('name') == 'testType' or x.get('name') == 'testType_quiz')
+            for x in inputs
+        ),
+        'hidden_input_count': min(len(hidden), 100),
+        'hidden_blank_count': min(blank_hidden_count, 100),
+        'hidden_zero_count': min(zero_hidden_count, 100),
+        'hidden_nonblank_redacted_count': min(
+            len(hidden) - blank_hidden_count - zero_hidden_count, 100
+        ),
+        'topic_after_grade_selection_verified': False,
+        'hidden_field_required_for_post_verified': False,
+        'no_grade_selected': True,
+        'no_ajax_called': True,
+        'no_submit_performed': True,
+        'read_only': True,
+    }
+
+
+def _readonly_topic_refresh_preflight(page):
+    """Discover trigger structure, but NEVER select a grade or perform AJAX.
+
+    Static form inspection alone cannot establish what the server would
+    return after choosing B3 ET. No handler names, bodies, or URLs leave RAM.
+    """
+    forms = [f for f in page.forms
+             if {'testGradeID', 'testName'}.issubset(
+                 {i.get('name') for i in f['inputs']})]
+    if len(forms) != 1:
+        return {'status': 'form_ambiguous', 'network_requests_sent': 0,
+                'post_refresh_verified': False, 'nigri_writes': False}
+    grades = [i for i in forms[0]['inputs']
+              if i.get('name') == 'testGradeID' and i.get('type') == 'select']
+    if len(grades) != 1:
+        return {'status': 'grade_selector_ambiguous', 'network_requests_sent': 0,
+                'post_refresh_verified': False, 'nigri_writes': False}
+    event = grades[0].get('onchange_hint', '').lower()
+    hints = page._inline_script_sample
+    inline_change = bool(event)
+    if 'submit(' in event or '.submit(' in event or 'form.submit' in event:
+        kind = 'possible_form_submit'
+    elif any(x in event for x in ('ajax', 'fetch(', 'xmlhttprequest', '.post(', '.get(')):
+        kind = 'inline_ajax_or_fetch'
+    elif inline_change:
+        kind = 'named_or_inline_handler'
+    elif 'grade-event' in hints and 'ajax-keyword' in hints:
+        kind = 'script_ajax_possible'
+    elif page.external_script_count:
+        kind = 'external_script_handler_possible'
+    else:
+        kind = 'handler_not_identified'
+    return {
+        'status': 'trigger_inspected',
+        'class_change_handler_kind': kind,
+        'inline_change_handler_present': inline_change,
+        'external_script_count': page.external_script_count,
+        'inline_script_present': page.inline_script_seen,
+        'inline_script_grade_reference_found': 'grade-event' in hints,
+        'inline_script_topic_reference_found': 'topic-event' in hints,
+        'inline_script_ajax_keyword_found': 'ajax-keyword' in hints,
+        'inline_script_post_keyword_found': 'post-keyword' in hints,
+        'topic_ajax_http_method_verified': False,
+        'post_refresh_verified': False,
+        'class_selection_performed': False,
+        'ajax_request_performed': False,
+        'network_requests_sent': 0,
+        'nigri_writes': False,
+    }
+
+
+def _offline_header_packet_check(structure):
+    """Prepare a dummy header POST *in memory* using approved names only.
+
+    Uses a deliberately invalid mock domain, never the Nigri action URL.
+    Dynamic selectors/hidden token fields remain unknown. No transport,
+    real student information, credentials, cookies, or form values.
+    """
+    required_names = {'testGradeID', 'testTopicID', 'testName',
+                      'testDate', 'testDesc', 'testType'}
+    actual_names = set(structure.get('recognized_fields_in_form', []))
+    missing_names = sorted(required_names - actual_names)
+    result = {
+        'status': 'offline_header_shape_not_confirmed',
+        'all_six_expected_fields_present': not missing_names,
+        'missing_known_fields': missing_names,
+        'mock_request_prepared': False,
+        'mock_request_sent': False,
+        'nigri_post_attempted': False,
+        'real_post_acceptance_verified': False,
+        'topic_ajax_dependencies_unverified': True,
+        'hidden_controls_require_future_review':
+            bool(structure.get('hidden_input_count')),
+    }
+    if (structure.get('status') != 'header_form_structure_found'
+            or structure.get('method') != 'post'
+            or structure.get('action_kind') != 'same_host_teacher_asp'
+            or not structure.get('create_button_present')
+            or missing_names):
+        return result
+
+    from nigri_http_dry_run import _prepare_only
+    synthetic = {
+        'testGradeID': '990001', 'testTopicID': '990002',
+        'testName': 'FICTIONAL HEADER ONLY', 'testDate': '2026-10-11',
+        'testDesc': '', 'testType': 'quiz',
+    }
+    # Request.prepare() serializes locally; .send() is never called.
+    mock = _prepare_only('POST', '/mock/new-mark', data=synthetic)
+    body = mock.body
+    if (not isinstance(body, str) or
+            not mock.headers.get('Content-Type', '').startswith(
+                'application/x-www-form-urlencoded') or
+            not all(name + '=' in body for name in required_names)):
+        return result
+    result.update(
+        status='offline_header_shape_prepared',
+        mock_request_prepared=True,
+        mock_header_field_count=len(synthetic),
+    )
+    return result
+
+
+def _probe_blank_mark_form(session, marks):
+    """One carefully validated GET, never a submit/POST. No redirects followed."""
+    target, why = _safe_blank_mark_url(marks)
+    if not target:
+        return {'status': 'blank_form_link_' + why, 'link_diagnostics': _blank_mark_link_diagnostics(marks), 'nigri_writes': False}
+    response = session.request('GET', target, timeout=(8, 20), allow_redirects=False)
+    if response.status_code != 200:
+        return {'status': 'blank_form_get_not_200',
+                'http_status': response.status_code,
+                'redirect_not_followed': response.status_code in (301, 302, 303, 307, 308),
+                'nigri_writes': False}
+    page = _page(response)
+    # Only approved field names; never expose field values, options, HTML,
+    # personal information, form actions, session cookies, or student records.
+    recognized = frozenset({
+        'testGradeID', 'testTopicID', 'testName', 'testDate',
+        'testDesc', 'testType', 'testCompleted',
+    })
+    inputs = [i for f in page.forms for i in f['inputs']]
+    names = sorted({i['name'] for i in inputs
+                    if i['name'] in recognized or i['name'].startswith('testType_') and
+                    len(i['name']) < 35 and i['name'][9:].isalnum()})
+    has_blank = {'testGradeID', 'testName'}.issubset(names)
+    create_button = any(i['type'] in ('submit', 'image', 'button')
+                        and i.get('value', '').strip() == 'Create Mark!' for i in inputs)
+    form_structure = _header_form_structure(page, target)
+    header_rehearsal = _offline_header_packet_check(form_structure)
+    return {
+        'status': 'blank_form_found' if has_blank else 'blank_form_unconfirmed',
+        'form_detected': has_blank,
+        'field_names': names[:30],
+        'form_count': len(page.forms),
+        'create_button_present': create_button,
+        'header_form_structure': form_structure,
+        'offline_header_rehearsal': header_rehearsal,
+        'readonly_form_dependencies': _readonly_mark_form_dependencies(page),
+        'topic_refresh_preflight': _readonly_topic_refresh_preflight(page),
+        'only_one_extra_get': True,
+        'no_submit_performed': True,
+        'nigri_writes': False,
+    }
+
+
+def probe_hybrid(*, inspect_blank_form=False):
+    """Read-only login through Chromium, then CLOSE it and GET marks over HTTP.
+
+    When inspect_blank_form is True, follow ONLY an allowlisted GET from
+    Nigri's authenticated Create New Mark link; never submit a form.
+    No Create Mark!, Save!, upload or delete requests. Cookies stay in memory
+    only; returned results contain no credentials, cookie details or student data.
+    """
+    from browser_runtime import log_memory, memory_snapshot, MIB, STOP_PERCENT
+    from classtime_reader import _chromium_args
+    from nigri_playwright import login
+    from playwright.sync_api import sync_playwright
+
+    if not os.environ.get('NIGRI_USERNAME') or not os.environ.get('NIGRI_PASSWORD'):
+        return {'status': 'credentials_missing', 'nigri_writes': False}
+
+    stage = 'starting_browser'
+    browser_cookies = []
+    user_agent = None
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=_chromium_args() + [
+                '--disk-cache-size=0', '--media-cache-size=0',
+            ])
+            log_memory('hybrid: chromium launched')
+            try:
+                # The cold-start browser sometimes exceeds 350 MiB BEFORE any
+                # page loads. Abort early rather than letting login trigger
+                # Render's 430 MiB memory guard. Hybrid only; don't change
+                # Attendance, Weekly Quiz or Classtime retrieval.
+                snapshot = memory_snapshot()
+                if snapshot and snapshot['working_set'] + 105 * MIB >= snapshot['limit'] * STOP_PERCENT / 100:
+                    return {'status': 'hybrid_insufficient_headroom', 'nigri_writes': False}
+                context = browser.new_context()
+                # Asset-heavy teacher login UI is not needed to obtain cookies;
+                # keep scripts, documents, CSS and API calls untouched.
+                context.route('**/*', _hybrid_login_router)
+                page = context.new_page()
+                stage = 'browser_signin'
+                login(page)  # Uses the existing proven browser sign-in.
+                log_memory('hybrid: browser sign-in completed')
+                browser_cookies = [
+                    x for x in context.cookies()
+                    if x.get('name') and x.get('value')
+                    and (x.get('domain', '').lstrip('.').lower() == HOST
+                         or x.get('domain', '').lstrip('.').lower() == 'nigrijewishonlineschool.com')
+                ]
+                user_agent = page.evaluate('navigator.userAgent')
+            finally:
+                browser.close()
+                log_memory('hybrid: chromium closed before HTTP')
+        stage = 'http_marks'
+        log_memory('hybrid: playwright driver closed')
+        with requests.Session() as session:
+            session.headers['User-Agent'] = user_agent or 'Mozilla/5.0'
+            for ck in browser_cookies:
+                session.cookies.set(
+                    ck['name'], ck['value'], domain=ck['domain'],
+                    path=ck.get('path') or '/', secure=ck.get('secure', True),
+                )
+            cookies_would_send = bool(
+                session.prepare_request(requests.Request('GET', MARKS_URL)).headers.get('Cookie')
+            )
+            response = _request(session, 'GET', MARKS_URL)  # Strictly read only.
+            marks = _page(response)
+            form_names = {i['name'] for f in marks.forms for i in f['inputs']}
+            has_marks = bool(
+                marks.has_create_text
+                or any('create new mark' in x['label'].lower() for x in marks.links)
+                or {'testGradeID', 'testName', 'testDate'} & form_names
+            )
+            has_login_form = any(
+                {'login', 'password'}.issubset({i['name'] for i in f['inputs']})
+                for f in marks.forms
+            )
+            result = {
+                'status': 'hybrid_marks_found' if has_marks else 'hybrid_marks_unconfirmed',
+                'marks_controls_found': has_marks,
+                'login_form_on_marks': has_login_form,
+                'browser_closed_before_http': True,
+                'transferred_cookie_count': len(browser_cookies),
+                'cookies_sent_to_marks': cookies_would_send,
+                'mark_entry_readonly': _mark_entry_readonly_summary(marks),
+                'nigri_writes': False,
+            }
+            if inspect_blank_form:
+                if not has_marks:
+                    result['blank_form'] = {'status': 'blank_form_marks_unconfirmed', 'nigri_writes': False}
+                else:
+                    result['blank_form'] = _probe_blank_mark_form(session, marks)
+            return result
+    except Exception:
+        # Never return exception text (could include sensitive URLs/cookies).
+        return {'status': 'hybrid_' + stage + '_stopped', 'nigri_writes': False}

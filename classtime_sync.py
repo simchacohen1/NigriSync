@@ -1,10 +1,9 @@
-"""Dry run for 'Sync to Nigri' from a Classtime review. Builds exactly what a real save WOULD send, without sending it.
+"""Plan a 'Sync to Nigri' from a Classtime review and build its request rows.
 
 Nothing here writes to Nigri. The only Nigri contact is one read of the existing marks list (list_mark_titles),
-to see whether a mark for this session is already there. A real save does not exist yet (can_save is always False).
+to see whether a mark for this session is already there. The preview stays read-only (can_save is always False).
 Student PDFs never leave the server; the preview reports only whether each one is attached and its size.
 """
-import base64
 import re
 from datetime import datetime
 from decimal import Decimal, ROUND_HALF_UP
@@ -70,7 +69,12 @@ def build_packet(result, pdfs, options, with_reports=False):
             if size > MAX_REPORT_BYTES: raise ValueError('A report is too large to send')
             report = {'attached': True, 'kb': round(size / 1024)}
             row['report_filename'] = _safe_file_part(s['nigri']['name']) + ' - ' + _safe_file_part(options['test_name']) + '.pdf'
-            if with_reports: row['report_base64'] = base64.b64encode(Path(path).read_bytes()).decode('ascii')
+            if with_reports:
+                # Keep the report on disk. Encoding every PDF as base64 here
+                # multiplies the save packet's memory use before Chromium even
+                # opens the mark. The save worker creates a named hard link (or
+                # a bounded-memory copy) and Playwright uploads that file path.
+                row['report_path'] = str(Path(path).resolve())
         else:
             blockers.append('A report PDF is not verified for a boy with a score; fix this before saving')
         students.append(row)
@@ -92,10 +96,12 @@ def find_duplicates(existing_titles, options, code):
     return hits
 
 
-def preview(result, pdfs, options, mark_titles, check_error=None):
+def preview(result, pdfs, options, mark_titles, check_error=None, *, duplicate_check_disabled=False):
     """The full dry-run answer. `mark_titles` is the read-only list from Nigri, or None if it could not be read."""
     packet, rows, blockers = build_packet(result, pdfs, options)
-    if mark_titles is None:
+    if duplicate_check_disabled:
+        check = {'status': 'skipped', 'detail': 'Nigri duplicate lookup is disabled. Check Nigri yourself before saving the same session again.'}
+    elif mark_titles is None:
         check = {'status': 'could_not_check', 'detail': check_error or 'Could not read the existing Nigri marks'}
         blockers.append('Could not check whether this session is already saved; a real save would refuse')
     elif not mark_titles.get('titles'):

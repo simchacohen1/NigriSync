@@ -1,0 +1,582 @@
+"""Blank New Mark inspection: one validated read-only GET, NEVER submit forms."""
+import sys
+import unittest
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import nigri_http_probe as probe
+
+
+LISTING = ('<a href="/main/default_os_prog.asp?section=teachers&amp;subSection=tests&amp;side=2">'
+           'Create New Mark</a>')
+FORM = ('<form method="post" action="/main/default_os_prog.asp?submit=save">'
+        '<select id="testGradeID" name="testGradeID"><option value="SECRET">SECRET</option></select>'
+        '<select id="testTopicID" name="testTopicID"></select>'
+        '<input name="testName" value="SENSITIVE_NAME">'
+        '<input name="testDate" value="DO_NOT_DISCLOSE">'
+        '<textarea name="testDesc"></textarea>'
+        '<input type="radio" name="testType" value="test">'
+        '<input type="submit" name="submit" value="Create Mark!">'
+        '</form>')
+
+
+class FakeResponse:
+    def __init__(self, html=FORM, status=200):
+        self.status_code = status
+        self.text = html
+        self.content = html.encode()
+        self.headers = {'Location': 'https://example.invalid/ignored'}
+
+
+class FakeSession:
+    def __init__(self, *, status=200, html=FORM):
+        self.calls = []
+        self.status = status
+        self.html = html
+
+    def request(self, method, url, **kw):
+        self.calls.append((method, url, kw))
+        return FakeResponse(self.html, self.status)
+
+
+class BlankMarkProbeTests(unittest.TestCase):
+    def run_probe(self, listing=LISTING, **kwargs):
+        session = FakeSession(**kwargs)
+        result = probe._probe_blank_mark_form(session, probe._page(FakeResponse(listing)))
+        return result, session
+
+    def test_readonly_get_finds_expected_form_structure(self):
+        result, session = self.run_probe()
+        self.assertEqual(result['status'], 'blank_form_found')
+        self.assertEqual(result['field_names'], [
+            'testDate', 'testDesc', 'testGradeID', 'testName', 'testTopicID', 'testType'])
+        self.assertTrue(result['create_button_present'])
+        self.assertTrue(result['only_one_extra_get'])
+        self.assertTrue(result['no_submit_performed'])
+        self.assertFalse(result['nigri_writes'])
+        self.assertEqual(len(session.calls), 1)
+        method, url, options = session.calls[0]
+        self.assertEqual(method, 'GET')
+        self.assertIn('side=2', url)
+        self.assertIs(options['allow_redirects'], False)
+        self.assertNotIn('SENSITIVE_NAME', str(result))
+        self.assertNotIn('DO_NOT_DISCLOSE', str(result))
+        self.assertNotIn('SECRET', str(result))
+
+    def test_readonly_header_form_structure_is_sanitized(self):
+        result, session = self.run_probe()
+        structure = result['header_form_structure']
+        self.assertEqual(structure['status'], 'header_form_structure_found')
+        self.assertEqual(structure['method'], 'post')
+        self.assertEqual(structure['action_kind'], 'same_host_teacher_asp')
+        self.assertEqual(structure['action_recognized_query_keys'], ['submit'])
+        self.assertEqual(structure['select_input_count'], 2)
+        self.assertTrue(structure['create_button_present'])
+        self.assertTrue(structure['form_not_submitted'])
+        self.assertFalse(structure['real_post_endpoint_verified'])
+        self.assertFalse(structure['real_post_result_verified'])
+        self.assertEqual([c[0] for c in session.calls], ['GET'])
+        self.assertNotIn('SENSITIVE_NAME', str(structure))
+        self.assertNotIn('DO_NOT_DISCLOSE', str(structure))
+        self.assertNotIn('SECRET', str(structure))
+        self.assertNotIn('=save', str(structure))
+
+    def test_hidden_token_values_names_and_unknown_query_redacted(self):
+        html = ('<form method="post" action="/main/default_os_prog.asp?'
+                'section=teachers&amp;spec=tests&amp;csrf=TOPSECRET&amp;testID=0">'
+                '<input type="hidden" name="privateSessionSecret" value="DO_NOT_EXPOSE">'
+                '<select name="testGradeID"></select>'
+                '<input name="testName" value="PRIVATE_TEST_NAME">'
+                '<input type="submit" name="submit" value="Create Mark!">'
+                '</form>')
+        result, session = self.run_probe(html=html)
+        summary = result['header_form_structure']
+        self.assertEqual(summary['status'], 'header_form_structure_found')
+        self.assertEqual(summary['hidden_input_count'], 1)
+        self.assertEqual(summary['action_kind'], 'same_host_teacher_asp')
+        self.assertEqual(summary['action_query_parameter_count'], 4)
+        self.assertEqual(summary['action_recognized_query_keys'], ['section', 'spec', 'testID'])
+        self.assertEqual(len(session.calls), 1)
+        for secret in ['TOPSECRET', 'DO_NOT_EXPOSE', 'privateSessionSecret', 'PRIVATE_TEST_NAME', 'csrf']:
+            self.assertNotIn(secret, str(summary))
+
+    def test_external_form_action_is_not_followed(self):
+        html = ('<form method="post" action="https://other.example/submit">'
+                '<select name="testGradeID"></select>'
+                '<input name="testName" value="PRIVATE">'
+                '<input type="submit" value="Create Mark!"></form>')
+        result, session = self.run_probe(html=html)
+        summary = result['header_form_structure']
+        self.assertEqual(summary['action_kind'], 'external_or_untrusted')
+        self.assertEqual(len(session.calls), 1)
+        self.assertEqual(session.calls[0][0], 'GET')
+        self.assertNotIn('other.example', str(summary))
+
+    def test_missing_form_method_does_not_assume_post(self):
+        html = ('<form action="">'
+                '<select name="testGradeID"></select>'
+                '<input name="testName">'
+                '</form>')
+        result, session = self.run_probe(html=html)
+        summary = result['header_form_structure']
+        self.assertEqual(summary['method'], 'get')
+        self.assertEqual(summary['action_kind'], 'current_blank_form_url')
+        self.assertFalse(summary['create_button_present'])
+        self.assertEqual(len(session.calls), 1)
+
+    def test_duplicate_or_fragmented_forms_not_treated_as_confirmed(self):
+        html = ('<form method="post"><input name="testGradeID"><input name="testName"></form>'
+                '<form method="post"><input name="testGradeID"><input name="testName"></form>')
+        result, session = self.run_probe(html=html)
+        summary = result['header_form_structure']
+        self.assertEqual(summary['status'], 'header_form_missing_or_ambiguous')
+        self.assertEqual(summary['candidate_count'], 2)
+        self.assertTrue(summary['form_not_submitted'])
+        self.assertEqual(len(session.calls), 1)
+
+    def test_offline_header_serialization_from_readonly_form(self):
+        from unittest.mock import patch
+        import requests
+        with patch.object(requests.sessions.Session, 'request',
+                          side_effect=AssertionError('NO NETWORK')),\
+             patch.object(requests.sessions.Session, 'send',
+                          side_effect=AssertionError('NO NETWORK')):
+            result, session = self.run_probe()
+        rehearsal = result['offline_header_rehearsal']
+        self.assertEqual(rehearsal['status'], 'offline_header_shape_prepared')
+        self.assertEqual(rehearsal['mock_header_field_count'], 6)
+        self.assertTrue(rehearsal['all_six_expected_fields_present'])
+        self.assertTrue(rehearsal['mock_request_prepared'])
+        self.assertFalse(rehearsal['mock_request_sent'])
+        self.assertFalse(rehearsal['nigri_post_attempted'])
+        self.assertFalse(rehearsal['real_post_acceptance_verified'])
+        self.assertTrue(rehearsal['topic_ajax_dependencies_unverified'])
+        self.assertFalse(result['nigri_writes'])
+        # FakeSession is the only transport for the single approved GET.
+        self.assertEqual(len(session.calls), 1)
+        self.assertEqual(session.calls[0][0], 'GET')
+
+    def test_offline_header_mock_ignores_untrusted_action_and_secret_values(self):
+        result, session = self.run_probe(html=(
+            '<form method="post" action="/main/default_os_prog.asp?'
+            'section=teachers&amp;spec=tests&amp;token=SENSITIVE">'
+            '<input name="testName" value="LEAK_ME">'
+            '<input name="testGradeID"><input name="testTopicID">'
+            '<input name="testType"><input name="testDate">'
+            '<input name="testDesc">'
+            '<input type="hidden" name="SENSITIVE_HIDDEN" value="TOPSECRET">'
+            '<input type="submit" value="Create Mark!"></form>'
+        ))
+        rehearsal = result['offline_header_rehearsal']
+        self.assertEqual(rehearsal['status'], 'offline_header_shape_prepared')
+        self.assertTrue(rehearsal['hidden_controls_require_future_review'])
+        self.assertTrue(rehearsal['topic_ajax_dependencies_unverified'])
+        self.assertFalse(rehearsal['real_post_acceptance_verified'])
+        for secret in ('LEAK_ME','SENSITIVE','TOPSECRET','SENSITIVE_HIDDEN'):
+            self.assertNotIn(secret, str(rehearsal))
+        self.assertEqual(len(session.calls), 1)
+
+    def test_offline_header_refuses_incomplete_or_untrusted_form(self):
+        htmls = (
+            '<form method="get" action="/main/default_os_prog.asp"><input name="testGradeID"><input name="testName"></form>',
+            '<form method="post" action="https://other.invalid/create"><input name="testGradeID"><input name="testName"></form>',
+            '<form method="post" action="/main/default_os_prog.asp"><input name="testGradeID"><input name="testName"></form>',
+            '<form method="post" action="/main/default_os_prog.asp"><input name="testGradeID"><input name="testName"><input name="testTopicID"><input name="testType"><input name="testDate"><input name="testDesc"></form>',
+        )
+        for html in htmls:
+            with self.subTest(html=html[:50]):
+                result, session = self.run_probe(html=html)
+                rehearsal = result['offline_header_rehearsal']
+                self.assertFalse(rehearsal['mock_request_prepared'])
+                self.assertFalse(rehearsal['nigri_post_attempted'])
+                self.assertFalse(rehearsal['real_post_acceptance_verified'])
+                self.assertEqual(len(session.calls), 1)
+
+    def test_readonly_hidden_categories_and_grade_topic_options(self):
+        html = (
+            '<form method="post" action="/main/default_os_prog.asp">'
+            '<select name="testGradeID">'
+            '<option value="">Select</option>'
+            '<option value="22590">Fictional Grade</option>'
+            '<option value="22453">Fictional Grade Two</option>'
+            '<option value="SENSITIVE_OTHER_GRADE">SENSITIVE_NAME</option>'
+            '</select>'
+            '<select name="testTopicID">'
+            '<option value="">Choose topic</option>'
+            '<option value="142">Shoroshim</option>'
+            '<option value="PRIVATE_STUDENT_TOKEN">PRIVATE_LABEL</option>'
+            '</select>'
+            '<input type="radio" name="testType" id="testType_quiz" value="quiz">'
+            '<input name="testName"><input name="testDate"><textarea name="testDesc"></textarea>'
+            '<input type="hidden" name="privateSessionKey" value="ULTRA_SECRET">'
+            '<input type="hidden" name="testID" value="0">'
+            '<input type="hidden" name="spareToken" value="">'
+            '<input type="submit" value="Create Mark!">'
+            '</form>'
+        )
+        result, session = self.run_probe(html=html)
+        details = result['readonly_form_dependencies']
+        self.assertEqual(details['status'], 'form_controls_observed')
+        self.assertTrue(details['b3_et_option_present'])
+        self.assertTrue(details['b3_wt_option_present'])
+        self.assertTrue(details['shoroshim_topic_option_initially_present'])
+        self.assertTrue(details['quiz_type_radio_present'])
+        self.assertEqual(details['hidden_input_count'], 3)
+        self.assertEqual(details['hidden_blank_count'], 1)
+        self.assertEqual(details['hidden_zero_count'], 1)
+        self.assertEqual(details['hidden_nonblank_redacted_count'], 1)
+        self.assertFalse(details['topic_after_grade_selection_verified'])
+        self.assertFalse(details['hidden_field_required_for_post_verified'])
+        self.assertTrue(details['no_grade_selected'])
+        self.assertTrue(details['no_ajax_called'])
+        self.assertTrue(details['no_submit_performed'])
+        self.assertTrue(details['read_only'])
+        for secret in ('ULTRA_SECRET', 'privateSessionKey',
+                       'SENSITIVE_OTHER_GRADE', 'SENSITIVE_NAME',
+                       'PRIVATE_STUDENT_TOKEN', 'PRIVATE_LABEL', 'spareToken'):
+            self.assertNotIn(secret, str(result))
+        self.assertEqual(len(session.calls), 1)
+        self.assertEqual(session.calls[0][0], 'GET')
+        self.assertFalse(result['nigri_writes'])
+
+    def test_absent_initial_topic_is_not_reported_as_ajax_failure(self):
+        result, session = self.run_probe(html=(
+            '<form method="post" action="/main/default_os_prog.asp">'
+            '<select name="testGradeID"><option value="22590">B3 ET</option></select>'
+            '<select name="testTopicID"><option value="">Choose</option></select>'
+            '<input name="testName"><input name="testDate">'
+            '<input name="testType"><textarea name="testDesc"></textarea>'
+            '<input type="hidden" name="secret" value="SESSION_VALUE">'
+            '<input type="submit" value="Create Mark!">'
+            '</form>'
+        ))
+        details = result['readonly_form_dependencies']
+        self.assertTrue(details['b3_et_option_present'])
+        self.assertFalse(details['shoroshim_topic_option_initially_present'])
+        self.assertFalse(details['topic_after_grade_selection_verified'])
+        self.assertTrue(details['no_ajax_called'])
+        self.assertEqual(details['hidden_nonblank_redacted_count'], 1)
+        self.assertNotIn('SESSION_VALUE', str(details))
+        self.assertEqual([call[0] for call in session.calls], ['GET'])
+
+    def test_only_targeted_select_options_inspected(self):
+        result, session = self.run_probe(html=(
+            '<form method="post" action="/main/default_os_prog.asp">'
+            '<select name="studentRoster">'
+            '<option value="22590">REAL_STUDENT_NAME_HIDDEN</option>'
+            '</select>'
+            '<select name="testGradeID"><option value="22453">B3 WT</option></select>'
+            '<select name="testTopicID"><option value="137">Other topic</option></select>'
+            '<input name="testName">'
+            '<input type="submit" value="Create Mark!">'
+            '</form>'
+        ))
+        details = result['readonly_form_dependencies']
+        self.assertFalse(details['b3_et_option_present'])
+        self.assertTrue(details['b3_wt_option_present'])
+        self.assertFalse(details['shoroshim_topic_option_initially_present'])
+        self.assertTrue(details['read_only'])
+        self.assertEqual(len(session.calls), 1)
+        self.assertNotIn('REAL_STUDENT_NAME_HIDDEN', str(result))
+
+    def test_refresh_preflight_detects_grade_onchange_without_selection(self):
+        html = (
+            '<form method="post" action="/main/default_os_prog.asp">'
+            '<select name="testGradeID" onchange="refreshNigriTopics(this.value)">'
+            '<option value="22590">B3 ET</option></select>'
+            '<select name="testTopicID"><option value="142">Shoroshim</option></select>'
+            '<input name="testName"><input name="testDate"><input name="testType">'
+            '<textarea name="testDesc"></textarea><input type="submit" value="Create Mark!">'
+            '</form>'
+            '<script src="/main/assets/private-student-secret.js"></script>'
+        )
+        result, session = self.run_probe(html=html)
+        t = result['topic_refresh_preflight']
+        self.assertEqual(t['status'], 'trigger_inspected')
+        self.assertEqual(t['class_change_handler_kind'], 'named_or_inline_handler')
+        self.assertTrue(t['inline_change_handler_present'])
+        self.assertEqual(t['external_script_count'], 1)
+        self.assertFalse(t['post_refresh_verified'])
+        self.assertFalse(t['class_selection_performed'])
+        self.assertFalse(t['ajax_request_performed'])
+        self.assertFalse(t['topic_ajax_http_method_verified'])
+        self.assertEqual(t['network_requests_sent'], 0)
+        self.assertEqual([x[0] for x in session.calls], ['GET'])
+        self.assertNotIn('refreshNigriTopics', str(t))
+        self.assertNotIn('private-student-secret', str(result))
+
+    def test_possible_form_post_is_not_attempted(self):
+        html = (
+            '<form method="post" action="/main/default_os_prog.asp">'
+            '<select name="testGradeID" onchange="this.form.submit()">'
+            '<option value="22590">B3 ET</option></select>'
+            '<select name="testTopicID"><option value="142">Shoroshim</option></select>'
+            '<input name="testName"><input name="testType"><input name="testDate">'
+            '<input name="testDesc"><input type="submit" value="Create Mark!">'
+            '</form>')
+        result, session = self.run_probe(html=html)
+        p = result['topic_refresh_preflight']
+        self.assertEqual(p['class_change_handler_kind'], 'possible_form_submit')
+        self.assertEqual(p['network_requests_sent'], 0)
+        self.assertFalse(p['post_refresh_verified'])
+        self.assertFalse(result['nigri_writes'])
+        self.assertEqual(len(session.calls), 1)
+
+    def test_inline_ajax_indications_are_not_executed_or_disclosed(self):
+        html = (
+            '<form method="post" action="/main/default_os_prog.asp">'
+            '<select name="testGradeID"><option value="22590">B3 ET</option></select>'
+            '<select name="testTopicID"><option value="142">Shoroshim</option></select>'
+            '<input name="testName"></form>'
+            '<script>function SECRET_STUDENT_FUNCTION(){'
+            'var testGradeID="PRIVATE_GRADE";'
+            'var testTopicID="PRIVATE_TOPIC";'
+            'fetch("/private/student/email");'
+            '$.post("/private/secret");'
+            '}</script>'
+        )
+        result, session = self.run_probe(html=html)
+        p = result['topic_refresh_preflight']
+        self.assertEqual(p['class_change_handler_kind'], 'script_ajax_possible')
+        self.assertTrue(p['inline_script_ajax_keyword_found'])
+        self.assertTrue(p['inline_script_post_keyword_found'])
+        self.assertTrue(p['inline_script_grade_reference_found'])
+        self.assertTrue(p['inline_script_topic_reference_found'])
+        self.assertFalse(p['topic_ajax_http_method_verified'])
+        self.assertEqual(p['network_requests_sent'], 0)
+        self.assertEqual(len(session.calls), 1)
+        for secret in ('SECRET_STUDENT_FUNCTION', 'PRIVATE_GRADE', 'PRIVATE_TOPIC', 'private/secret', 'private/student/email'):
+            self.assertNotIn(secret, str(result))
+
+    def test_static_form_only_never_claims_refreshed_topic(self):
+        result, session = self.run_probe()
+        p = result['topic_refresh_preflight']
+        self.assertFalse(p['post_refresh_verified'])
+        self.assertFalse(p['class_selection_performed'])
+        self.assertFalse(p['ajax_request_performed'])
+        self.assertEqual(p['network_requests_sent'], 0)
+        self.assertEqual(len(session.calls), 1)
+
+    def test_redirect_is_never_followed(self):
+        result, session = self.run_probe(status=302)
+        self.assertEqual(result['status'], 'blank_form_get_not_200')
+        self.assertTrue(result['redirect_not_followed'])
+        self.assertEqual(len(session.calls), 1)
+        self.assertIs(session.calls[0][2]['allow_redirects'], False)
+
+    def test_get_does_not_claim_success_for_nonform(self):
+        result, session = self.run_probe(html='<div>Nothing here</div>')
+        self.assertEqual(result['status'], 'blank_form_unconfirmed')
+        self.assertFalse(result['form_detected'])
+        self.assertEqual(len(session.calls), 1)
+
+    def test_known_new_form_action_allowed(self):
+        link = ('<a href="/main/default_os_prog.asp?section=teachers&amp;'
+                'spec=tests&amp;action=new_test">Create New Mark</a>')
+        result, session = self.run_probe(link)
+        self.assertEqual(result['status'], 'blank_form_found')
+        self.assertEqual(len(session.calls), 1)
+
+    def test_real_blank_new_mark_pattern_opens_only_form_get(self):
+        href = ('/main/default_os_prog.asp?section=teachers&spec=tests'
+                '&testCoursTypeSelect=&testGradeSelect=&testID=0&testTopicSelect=')
+        result, session = self.run_probe(
+            '<a href="' + href.replace('&', '&amp;') + '">Create New Mark</a>')
+        self.assertEqual(result['status'], 'blank_form_found')
+        self.assertEqual(len(session.calls), 1)
+        method, target, kwargs = session.calls[0]
+        self.assertEqual(method, 'GET')
+        self.assertEqual(kwargs['allow_redirects'], False)
+        self.assertIn('testID=0', target)
+        self.assertTrue(result['no_submit_performed'])
+        self.assertFalse(result['nigri_writes'])
+
+    def test_all_other_variations_of_new_mark_params_are_blocked(self):
+        base = {
+            'section': 'teachers', 'spec': 'tests',
+            'testCoursTypeSelect': '', 'testGradeSelect': '',
+            'testID': '0', 'testTopicSelect': '',
+        }
+        cases = [
+            {'testID': '1'},
+            {'testID': '12'},
+            {'testID': ''},
+            {'testID': '00'},
+            {'testID': '-1'},
+            {'testID': 'new'},
+            {'testGradeSelect': '3'},
+            {'testTopicSelect': '1'},
+            {'testCoursTypeSelect': 'quiz'},
+            {'section': 'students'},
+            {'spec': 'homework'},
+        ]
+        for change in cases:
+            with self.subTest(change=change):
+                params = dict(base, **change)
+                href = '/main/default_os_prog.asp?' + '&'.join(
+                    k + '=' + v for k, v in params.items())
+                result, session = self.run_probe(
+                    '<a href="' + href.replace('&', '&amp;') + '">Create New Mark</a>')
+                self.assertEqual(session.calls, [])
+                self.assertTrue(result['status'].startswith('blank_form_link_'))
+                self.assertFalse(result['nigri_writes'])
+
+    def test_new_mark_link_extra_or_missing_parameters_never_open(self):
+        url = ('/main/default_os_prog.asp?section=teachers&spec=tests'
+               '&testCoursTypeSelect=&testGradeSelect=&testID=0&testTopicSelect=')
+        for href in [url + '&action=save',
+                     url + '&testID=0',
+                     url + '&testID=11',
+                     url.replace('&testTopicSelect=', ''),
+                     url.replace('spec=tests', 'subSection=tests'),
+                     url + '&unsafeToken=hello']:
+            with self.subTest(href=href):
+                result, session = self.run_probe(
+                    '<a href="' + href.replace('&', '&amp;') + '">Create New Mark</a>')
+                self.assertEqual(session.calls, [])
+                self.assertFalse(result['nigri_writes'])
+
+    def test_blank_new_mark_302_never_follows_redirect(self):
+        href = ('/main/default_os_prog.asp?section=teachers&spec=tests'
+                '&testCoursTypeSelect=&testGradeSelect=&testID=0&testTopicSelect=')
+        result, session = self.run_probe(
+            '<a href="' + href.replace('&', '&amp;') + '">Create New Mark</a>',
+            status=302)
+        self.assertEqual(result['status'], 'blank_form_get_not_200')
+        self.assertTrue(result['redirect_not_followed'])
+        self.assertEqual(len(session.calls), 1)
+
+    def test_malformed_or_mutating_links_never_requested(self):
+        urls = [
+            '', '#new', 'javascript:submitMark()',
+            'https://evil.example/main/default_os_prog.asp?section=teachers&spec=tests',
+            '/main/default_os_prog.asp?section=teachers&subSection=tests&action=delete',
+            '/main/default_os_prog.asp?section=teachers&subSection=tests&action=save',
+            '/main/default_os_prog.asp?section=teachers&subSection=tests&action=edit',
+            '/main/default_os_prog.asp?section=teachers&subSection=tests&testID=42',
+            '/main/default_os_prog.asp?section=teachers&subSection=tests&submit=1',
+            '/main/default_os_prog.asp?section=students&subSection=tests&side=2',
+            '/main/other.asp?section=teachers&subSection=tests&side=2',
+            '/main/default_os_prog.asp?section=teachers&subSection=tests&side=2#next',
+        ]
+        for url in urls:
+            with self.subTest(url=url):
+                listing = '<a href="' + url.replace('&', '&amp;') + '">Create New Mark</a>'
+                result, session = self.run_probe(listing)
+                self.assertTrue(result['status'].startswith('blank_form_link_'))
+                self.assertEqual(session.calls, [])
+                self.assertFalse(result['nigri_writes'])
+
+    def test_rejected_link_reports_only_safe_shape(self):
+        unsafe = ('/main/other.asp?section=teachers&spec=tests&token=PRIVATE_TOKEN'
+                  '&action=save&testID=813')
+        listing = '<a href="' + unsafe.replace('&', '&amp;') + '">Create New Mark</a>'
+        result, session = self.run_probe(listing)
+        self.assertEqual(session.calls, [])
+        diag = result['link_diagnostics']
+        self.assertEqual(diag['link_kind'], 'same_host_https')
+        self.assertFalse(diag['expected_asp_path'])
+        self.assertEqual(diag['recognized_query_keys'], ['action', 'section', 'spec'])
+        self.assertEqual(diag['unknown_query_key_count'], 2)
+        self.assertEqual(diag['safe_unknown_parameter_names'], ['testID'])
+        self.assertEqual(diag['redacted_parameter_name_count'], 1)
+        self.assertEqual(diag['unsupported_action_key_count'], 1)
+        self.assertTrue(diag['no_navigation'])
+        self.assertNotIn('PRIVATE_TOKEN', str(result))
+        self.assertNotIn('813', str(result))
+        self.assertNotIn('token', str(result))
+        self.assertNotIn('/main/other.asp', str(result))
+
+    def test_link_with_no_query_keys_does_not_expose_path(self):
+        result, session = self.run_probe(
+            '<a href="/main/nigri-new-mark.asp">Create New Mark</a>')
+        self.assertEqual(session.calls, [])
+        self.assertEqual(result['link_diagnostics']['recognized_query_keys'], [])
+        self.assertFalse(result['link_diagnostics']['expected_asp_path'])
+        self.assertNotIn('nigri-new-mark.asp', str(result))
+
+    def test_missing_query_names_are_reported_without_values(self):
+        target = ('/main/default_os_prog.asp?section=teachers&spec=tests'
+                  '&menuID=SECRET_NUMBER&position=SECRET_POSITION'
+                  '&token=SECRET_TOKEN&loginEmail=PRIVATE_PERSON')
+        html = '<a href="' + target.replace('&', '&amp;') + '">Create New Mark</a>'
+        result, session = self.run_probe(html)
+        self.assertEqual(session.calls, [])
+        diag = result['link_diagnostics']
+        self.assertEqual(diag['safe_unknown_parameter_names'], ['menuID', 'position'])
+        self.assertEqual(diag['redacted_parameter_name_count'], 2)
+        self.assertEqual(diag['unknown_query_key_count'], 4)
+        self.assertFalse(result['nigri_writes'])
+        for secret in ('SECRET_NUMBER', 'SECRET_POSITION', 'SECRET_TOKEN',
+                       'PRIVATE_PERSON', 'loginEmail'):
+            self.assertNotIn(secret, str(result))
+
+    def test_selection_parameter_types_no_values(self):
+        link = ('/main/default_os_prog.asp?section=teachers&spec=tests'
+                '&testCoursTypeSelect=0&testGradeSelect=12'
+                '&testID=0&testTopicSelect=')
+        html = '<a href="' + link.replace('&', '&amp;') + '">Create New Mark</a>'
+        result, session = self.run_probe(html)
+        self.assertEqual(session.calls, [])
+        diag = result['link_diagnostics']
+        self.assertEqual(diag['selection_parameter_kinds'], {
+            'testCoursTypeSelect': 'zero',
+            'testGradeSelect': 'nonzero_number',
+            'testID': 'zero',
+            'testTopicSelect': 'blank',
+        })
+        self.assertFalse(diag['test_id_may_reference_existing_mark'])
+        self.assertFalse(result['nigri_writes'])
+        self.assertNotIn('12', str(diag))
+
+    def test_nonzero_test_id_may_reference_existing_mark(self):
+        link = ('/main/default_os_prog.asp?section=teachers&spec=tests'
+                '&testCoursTypeSelect=0&testGradeSelect=&testID=98765432&testTopicSelect=1')
+        result, session = self.run_probe(
+            '<a href="' + link.replace('&', '&amp;') + '">Create New Mark</a>')
+        self.assertEqual(session.calls, [])
+        diag = result['link_diagnostics']
+        self.assertEqual(diag['selection_parameter_kinds']['testID'], 'nonzero_number')
+        self.assertTrue(diag['test_id_may_reference_existing_mark'])
+        self.assertNotIn('98765432', str(diag))
+        self.assertFalse(result['nigri_writes'])
+
+    def test_sensitive_selector_values_are_redacted(self):
+        link = ('/main/default_os_prog.asp?section=teachers&spec=tests'
+                '&testCoursTypeSelect=SENSITIVE_DATA&testID=PRIVATE_ID'
+                '&testGradeSelect=HIDDEN_TEXT_VALUE&testTopicSelect=-9')
+        result, session = self.run_probe(
+            '<a href="' + link.replace('&', '&amp;') + '">Create New Mark</a>')
+        self.assertEqual(session.calls, [])
+        diag = result['link_diagnostics']
+        self.assertEqual(set(diag['selection_parameter_kinds'].values()),
+                         {'other_redacted'})
+        self.assertTrue(diag['test_id_may_reference_existing_mark'])
+        for value in ('SENSITIVE_DATA', 'PRIVATE_ID', 'HIDDEN_TEXT_VALUE', '-9'):
+            self.assertNotIn(value, str(result))
+
+    def test_duplicate_test_id_is_not_considered_blank(self):
+        link = ('/main/default_os_prog.asp?section=teachers&spec=tests'
+                '&testID=0&testID=999')
+        result, session = self.run_probe(
+            '<a href="' + link.replace('&', '&amp;') + '">Create New Mark</a>')
+        self.assertEqual(session.calls, [])
+        diag = result['link_diagnostics']
+        self.assertEqual(diag['selection_parameter_kinds']['testID'],
+                         'repeated_or_missing')
+        self.assertTrue(diag['test_id_may_reference_existing_mark'])
+        self.assertTrue(diag['has_duplicate_keys'])
+
+    def test_multiple_create_links_are_rejected(self):
+        result, session = self.run_probe(LISTING + LISTING)
+        self.assertEqual(result['status'], 'blank_form_link_link_missing_or_ambiguous')
+        self.assertEqual(session.calls, [])
+
+    def test_existing_marks_listing_is_not_new_form(self):
+        listing = '<a href="' + probe.MARKS_URL.replace('&', '&amp;') + '">Create New Mark</a>'
+        result, session = self.run_probe(listing)
+        self.assertEqual(result['status'], 'blank_form_link_link_is_listing')
+        self.assertEqual(session.calls, [])
+
+
+if __name__ == '__main__':
+    unittest.main()

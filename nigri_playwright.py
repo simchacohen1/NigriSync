@@ -871,7 +871,7 @@ def select_topic_robust(page, class_section, topic_label, timeout_ms=15000, poll
     )
 
 
-def fill_student_mark(page, name, mark=None, attendance="present", comment=None, report_base64=None, report_filename=None):
+def fill_student_mark(page, name, mark=None, attendance="present", comment=None, report_base64=None, report_filename=None, report_path=None):
     """
     Fills in one student's row on the per-student marks screen (the
     screen that only exists after "Create Mark!" has been submitted --
@@ -897,11 +897,10 @@ def fill_student_mark(page, name, mark=None, attendance="present", comment=None,
         still needs his 0 mark and his quiz-link comment filled in even
         while his attendance is left unresolved.
 
-    report_base64, if given, is a base64-encoded PDF (the per-student
-    question-by-question report generated client-side in
-    B3SchoolMarksBridge.html) attached directly into the real File1
-    upload field -- no temp file needed, Playwright can attach an
-    in-memory buffer straight to a file input.
+    report_path, if given, is a verified PDF kept on disk and passed to
+    Playwright as a path. Classtime uses this so a whole-class save does
+    not keep all reports base64-encoded in memory. report_base64 remains
+    supported for the existing Weekly Quiz path.
     """
     if name not in REWARDS_CHILD_IDS:
         raise RuntimeError(f"No known childID for student: {name}")
@@ -934,7 +933,15 @@ def fill_student_mark(page, name, mark=None, attendance="present", comment=None,
     if comment:
         page.locator(f'textarea[name="testChild_{cid}_markComment"]').fill(str(comment))
 
-    if report_base64:
+    if report_path:
+        # Playwright streams a local file path into the file input. Classtime
+        # uses this path so a whole-class save never keeps every PDF encoded in
+        # Python memory at once. The temporary alias already has the requested
+        # student-facing filename.
+        if not os.path.isfile(report_path):
+            raise FileNotFoundError("Verified report PDF is unavailable")
+        page.locator(f'input[name="testChild_{cid}_File1"]').set_input_files(report_path)
+    elif report_base64:
         page.locator(f'input[name="testChild_{cid}_File1"]').set_input_files({
             "name": report_filename or f"{name} - report.pdf",
             "mimeType": "application/pdf",
@@ -952,6 +959,8 @@ def run_marks_sync(
     description=None,
     mark_all_done=True,
     credentials=None,
+    *,
+    classtime_memory_saver=False,
 ):
     """
     credentials: the signed-in teacher's own Nigri login; None (owner / old key) = the service's own account.
@@ -977,6 +986,8 @@ def run_marks_sync(
       "absent" | "review", "comment": (optional)}, ...] -- "name" must
       be a key in REWARDS_CHILD_IDS.
     mark_type: one of "homework", "test", "quiz", "classwork".
+    classtime_memory_saver: use the Classtime-only, lower-memory Chromium flags;
+      the existing Attendance and Weekly Quiz callers are unaffected.
     """
     if class_section not in MARKS_GRADE_IDS:
         raise ValueError(f"Unknown class_section: {class_section}")
@@ -986,7 +997,13 @@ def run_marks_sync(
     results = []
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        # Classtime-only low-RAM browser; all other Nigri callers retain
+        # their original Chromium launch settings.
+        if classtime_memory_saver:
+            from classtime_reader import _chromium_args
+            browser = p.chromium.launch(headless=True, args=_chromium_args())
+        else:
+            browser = p.chromium.launch(headless=True)
         page = browser.new_page()
 
         login(page, credentials)
@@ -1063,6 +1080,7 @@ def run_marks_sync(
                     comment=student.get("comment"),
                     report_base64=student.get("report_base64"),
                     report_filename=student.get("report_filename"),
+                    report_path=student.get("report_path"),
                 )
                 results.append(f"{name}: filled (attendance={attendance})")
             except Exception as e:
