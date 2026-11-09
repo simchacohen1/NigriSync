@@ -40,6 +40,7 @@ class Base(unittest.TestCase):
         self.backend = S.MemoryBackend()
         R._store = S.NigriLoginStore(self.backend, S.load_keyring(KEY))
         R._teacher_check = lambda uid: uid in TEACHERS
+        R._school_check = lambda uid, claims: {'allowed': True, 'reason': 'ok', 'reset_at': None}  # see test_nigri_school_access.py
         R._hits.clear()
         self.patches = [patch.object(R, '_verify_token', fake_verify), patch.dict(os.environ, {'NIGRI_LOGIN_ENABLED': '1'})]
         for p in self.patches: p.start()
@@ -47,7 +48,7 @@ class Base(unittest.TestCase):
 
     def tearDown(self):
         for p in self.patches: p.stop()
-        R._store = R._teacher_check = None
+        R._store = R._teacher_check = R._school_check = None
 
     def call(self, method, token='tok-t1', **kw):
         headers = {'Authorization': 'Bearer ' + token} if token else {}
