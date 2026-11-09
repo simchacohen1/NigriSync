@@ -99,3 +99,11 @@ document.getElementById('syncNigriBtn').addEventListener('click', async () => {
 - Whether "points" on BrightPath's side is already the exact number
   you want in the 0–30 Rewards field, or needs any rounding/clamping
   since Nigri caps at 30
+
+## Per-teacher Nigri login storage (issue 550, step 1, not used by any route yet)
+
+`nigri_login_store.py` encrypts a teacher's Nigri username and password (AES-256-GCM, tied to the teacher's id) and
+keeps only the scrambled text in Firebase at `b3Private/nigriLogins/<teacherUid>` (closed to every browser by the
+rules). Render settings, all secret: `NIGRI_LOGIN_KEYS` (`id:base64key`, first one encrypts, others still open old
+records; make one with `openssl rand -base64 32`), `FIREBASE_SERVICE_ACCOUNT_JSON`, `FIREBASE_DATABASE_URL`.
+Tests use made-up names and mock storage only: `python -m unittest tests.test_nigri_login_store`.
