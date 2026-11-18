@@ -72,16 +72,17 @@ def _check_uid(uid):
     return uid
 
 
-def _aad(uid, kid):
+def _aad(uid, kid, purpose='nigri-login'):
     # Ties the record to ONE teacher: copied under another uid, it will not open.
-    return ('nigri-login|v%d|%s|%s' % (RECORD_VERSION, uid, kid)).encode('utf-8')
+    # `purpose` also ties it to ONE service, so a Mashpia record can never be opened as a Nigri one.
+    return ('%s|v%d|%s|%s' % (purpose, RECORD_VERSION, uid, kid)).encode('utf-8')
 
 
 def _b64(data):
     return base64.b64encode(data).decode('ascii')
 
 
-def encrypt_login(uid, username, password, keyring, now=None):
+def encrypt_login(uid, username, password, keyring, now=None, purpose='nigri-login'):
     uid = _check_uid(uid)
     for value in (username, password):
         if not isinstance(value, str) or not value.strip() or len(value) > MAX_FIELD:
@@ -89,12 +90,12 @@ def encrypt_login(uid, username, password, keyring, now=None):
     kid, keys = keyring
     payload = json.dumps({'u': username, 'p': password, 'h': username[-4:]}).encode('utf-8')
     nonce = os.urandom(12)   # new random value every time
-    ct = AESGCM(keys[kid]).encrypt(nonce, payload, _aad(uid, kid))
+    ct = AESGCM(keys[kid]).encrypt(nonce, payload, _aad(uid, kid, purpose))
     return {'v': RECORD_VERSION, 'kid': kid, 'n': _b64(nonce), 'ct': _b64(ct),
             'updatedAt': int((time.time() if now is None else now) * 1000)}
 
 
-def decrypt_login(uid, record, keyring):
+def decrypt_login(uid, record, keyring, purpose='nigri-login'):
     """Returns a dict {username, password, hint}. Any failure is the same generic error (no oracle)."""
     uid = _check_uid(uid)
     try:
@@ -103,7 +104,7 @@ def decrypt_login(uid, record, keyring):
         kid = record['kid']
         key = keyring[1][kid]
         plain = AESGCM(key).decrypt(base64.b64decode(record['n'], validate=True),
-                                    base64.b64decode(record['ct'], validate=True), _aad(uid, kid))
+                                    base64.b64decode(record['ct'], validate=True), _aad(uid, kid, purpose))
         data = json.loads(plain.decode('utf-8'))
         return {'username': data['u'], 'password': data['p'], 'hint': data['h']}
     except (KeyError, ValueError, TypeError, binascii.Error, InvalidTag):
@@ -129,7 +130,8 @@ class MemoryBackend:
 class FirebaseRestBackend:
     """Reads/writes b3Private/nigriLogins/<uid> over the Realtime Database REST API as the server's service account."""
 
-    def __init__(self, database_url=None, session=None, service_account_json=None):
+    def __init__(self, database_url=None, session=None, service_account_json=None, login_path=LOGIN_PATH):
+        self.login_path = login_path
         self.base = (database_url or os.environ.get('FIREBASE_DATABASE_URL', '')).rstrip('/')
         if not self.base.startswith('https://'):
             raise LoginStoreError('FIREBASE_DATABASE_URL is not set up correctly')
@@ -148,7 +150,7 @@ class FirebaseRestBackend:
         return self._session
 
     def _url(self, uid):
-        return '%s/%s/%s.json' % (self.base, LOGIN_PATH, _check_uid(uid))
+        return '%s/%s/%s.json' % (self.base, self.login_path, _check_uid(uid))
 
     def _check(self, response):
         if response.status_code >= 300:
@@ -173,13 +175,14 @@ class FirebaseRestBackend:
 
 
 class NigriLoginStore:
-    def __init__(self, backend, keyring):
+    def __init__(self, backend, keyring, purpose='nigri-login'):
         self.backend = backend
         self.keyring = keyring
+        self.purpose = purpose
 
     def save(self, uid, username, password, now=None):
         """Save or replace this teacher's login. Returns the safe status (never the password)."""
-        record = encrypt_login(uid, username, password, self.keyring, now=now)
+        record = encrypt_login(uid, username, password, self.keyring, now=now, purpose=self.purpose)
         self.backend.put(uid, record)
         return {'saved': True, 'hint': username[-4:], 'updatedAt': record['updatedAt']}
 
@@ -188,7 +191,7 @@ class NigriLoginStore:
         record = self.backend.get(_check_uid(uid))
         if record is None:
             return {'saved': False}
-        data = decrypt_login(uid, record, self.keyring)
+        data = decrypt_login(uid, record, self.keyring, self.purpose)
         return {'saved': True, 'hint': data['hint'], 'updatedAt': record.get('updatedAt')}
 
     def remove(self, uid):
@@ -209,7 +212,7 @@ class NigriLoginStore:
         record = self.backend.get(_check_uid(uid))
         if record is None:
             return None
-        data = decrypt_login(uid, record, self.keyring)
+        data = decrypt_login(uid, record, self.keyring, self.purpose)
         return Credentials(data['username'], data['password'])
 
     def reencrypt(self, uid):
@@ -217,12 +220,20 @@ class NigriLoginStore:
         record = self.backend.get(_check_uid(uid))
         if record is None:
             return False
-        data = decrypt_login(uid, record, self.keyring)
+        data = decrypt_login(uid, record, self.keyring, self.purpose)
         self.backend.put(uid, encrypt_login(uid, data['username'], data['password'], self.keyring,
-                                            now=record.get('updatedAt', 0) / 1000))
+                                            now=record.get('updatedAt', 0) / 1000, purpose=self.purpose))
         return True
 
 
 def store_from_environment():
     """Used by the server once routes exist (step 2). Fails closed if the key or Firebase settings are missing."""
     return NigriLoginStore(FirebaseRestBackend(), load_keyring())
+
+
+MASHPIA_LOGIN_PATH = 'b3Private/mashpiaLogins'
+
+
+def mashpia_store_from_environment():
+    """Teacher's own Mashpia login: same lock and key as Nigri, its own Firebase path and its own purpose label."""
+    return NigriLoginStore(FirebaseRestBackend(login_path=MASHPIA_LOGIN_PATH), load_keyring(), purpose='mashpia-login')
