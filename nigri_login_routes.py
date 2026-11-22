@@ -36,11 +36,8 @@ def project_id():
 
 
 def _verify_token(token):
-    from google.oauth2 import id_token
-    from google.auth.transport.requests import Request
-    claims = id_token.verify_firebase_token(token, Request(), audience=project_id())
-    if claims.get('iss') != 'https://securetoken.google.com/' + project_id() or claims.get('email_verified') is not True:
-        return None
+    import firebase_token
+    claims, _reason = firebase_token.verify(token, project_id())
     return claims
 
 
@@ -61,7 +58,7 @@ def _get_store():
 
 
 def owner_email():
-    return os.environ.get('NIGRI_OWNER_EMAIL', A.OWNER_EMAIL)
+    return A.owner_email()
 
 
 def _caller():

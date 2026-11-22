@@ -33,6 +33,17 @@ def _result(allowed, reason, school_id='', reset_at=None):
     return {'allowed': allowed, 'reason': reason, 'school_id': school_id, 'reset_at': reset_at}
 
 
+def owner_email():
+    """The ONE owner-email setting. NIGRI_OWNER_EMAIL wins; the older CLASSTIME_REVIEW_OWNER_EMAIL is still read
+    if only that one is set; otherwise the production owner. A warning is logged if both are set and differ."""
+    import logging, os
+    primary = os.environ.get('NIGRI_OWNER_EMAIL', '').strip().lower()
+    legacy = os.environ.get('CLASSTIME_REVIEW_OWNER_EMAIL', '').strip().lower()
+    if primary and legacy and primary != legacy:
+        logging.getLogger('nigri.auth').warning('NIGRI_OWNER_EMAIL and CLASSTIME_REVIEW_OWNER_EMAIL differ; using NIGRI_OWNER_EMAIL')
+    return primary or legacy or OWNER_EMAIL.lower()
+
+
 def is_owner(claims, owner_email=OWNER_EMAIL):
     return bool(claims) and claims.get('email_verified') is True and \
         str(claims.get('email', '')).strip().lower() == owner_email.lower()
